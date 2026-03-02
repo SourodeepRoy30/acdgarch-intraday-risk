@@ -1,0 +1,545 @@
+---
+title: "02 — Data Preparation: Tick Quotes to Event-Time Series"
+subtitle: "ACD-GARCH Intraday Volatility & Market Risk Forecasting — BP LSE Tick Data"
+author: "Sourodeep Roy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+## Purpose
+
+This notebook ingests raw BP LSE tick quote data (April–June 2020) and
+produces clean event-time series ready for ACD modelling.
+
+**Key design decision:** Events are defined as *midquote changes* — quote
+updates where the mid-price `(ask + bid) / 2` moves. This filters out
+volume-only updates that carry no price information and would produce
+spurious zero-return durations in the ACD model.
+
+- **Inputs:**  `data/raw/BPGBGBX_Ticks_2020.04.01_2020.06.30.csv`
+- **Outputs:**
+  - `data/processed/tick_clean.rds`   — full filtered quote data (all months)
+  - `data/processed/events_apr.rds`   — April event-time series (training)
+  - `data/processed/events_may.rds`   — May event-time series (test)
+  - `data/processed/events_jun.rds`   — June event-time series (test)
+
+---
+
+## 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+```{r load-packages}
+# Source the project setup so all packages and global options are loaded.
+# This ensures timezone, seed, and package state are consistent with 01_setup.Rmd.
+suppressPackageStartupMessages({
+  library(data.table)
+  library(lubridate)
+  library(ggplot2)
+  library(here)
+})
+```
+
+---
+
+## 2. Load Raw Data
+
+```{r load-data}
+# Construct path relative to project root using here::here().
+# This ensures the notebook runs identically on any machine.
+data_path <- here::here("data", "raw", "BPGBGBX_Ticks_2020.04.01_2020.06.30.csv")
+
+stopifnot("Raw data file not found — check data/raw/" = file.exists(data_path))
+
+# fread() is used for speed on 1M+ row files.
+# data.table is the right tool here — base read.csv would be ~10x slower.
+tick_raw <- fread(data_path)
+
+cat("Raw rows loaded:", format(nrow(tick_raw), big.mark = ","), "\n")
+cat("Columns:", paste(names(tick_raw), collapse = ", "), "\n")
+```
+
+```{r rename-columns}
+# Rename to clean, lowercase, no-space column names for easier referencing
+setnames(tick_raw,
+  old = c("Time (Europe/London)", "Ask", "Bid", "AskVolume", "BidVolume"),
+  new = c("time_raw", "ask", "bid", "ask_volume", "bid_volume")
+)
+```
+
+---
+
+## 3. Parse Timestamps
+
+```{r parse-timestamps}
+# Timestamps arrive as character strings with millisecond precision,
+# e.g. "2020.04.01 08:00:11.526". We parse these to POSIXct so we can
+# compute inter-event durations accurately.
+#
+# Format: %Y.%m.%d %H:%M:%OS — the %OS handles fractional seconds.
+# tz = "Europe/London" is critical: the period spans the BST transition
+# (clocks go forward on 29 March 2020, before our sample; we are already in BST
+# for the full April-June window, but we keep the tz explicit throughout).
+
+tick_raw[, timestamp := as.POSIXct(
+  trimws(as.character(time_raw)),
+  format = "%Y.%m.%d %H:%M:%OS",
+  tz     = "Europe/London"
+)]
+
+# Hard stop if any timestamps failed to parse — silent NA timestamps would
+# produce incorrect durations without any downstream error message
+n_failed <- sum(is.na(tick_raw$timestamp))
+if (n_failed > 0) stop(n_failed, " timestamps failed to parse. Check raw file format.")
+
+# Drop the original raw time column — we no longer need it
+tick_raw[, time_raw := NULL]
+
+# Show ms precision is preserved (display-only — does not affect calculations)
+options(digits.secs = 3)
+head(tick_raw[, .(
+  timestamp_display = format(timestamp, "%Y-%m-%d %H:%M:%OS3"),
+  ask, bid
+)], 6)
+```
+
+---
+
+## 4. Sort and Time Integrity Checks
+
+```{r sort-and-check}
+# ACD models require a strictly ordered time series.
+# We sort by timestamp and then check for any time reversals.
+setorder(tick_raw, timestamp)
+
+# Check 1: time must never go backwards
+n_reversals <- sum(diff(as.numeric(tick_raw$timestamp)) < 0)
+stopifnot("Time reversals detected — check raw data ordering" = n_reversals == 0)
+cat("Time reversals:", n_reversals, "(none expected)\n")
+
+# Check 2: duplicate timestamps — report count but do NOT hard-stop.
+# Multiple quote updates within the same millisecond are normal in
+# high-frequency data (e.g. simultaneous bid and ask updates).
+# These are handled naturally when we filter to midquote-change events.
+n_dup <- sum(duplicated(tick_raw$timestamp))
+cat("Duplicate timestamps:", format(n_dup, big.mark = ","),
+    "(expected — multiple updates can share a millisecond)\n")
+```
+
+---
+
+## 5. Quote Sanity Checks
+
+```{r quote-checks}
+# Prices must be positive and ask >= bid (no crossed quotes)
+stopifnot(
+  "Negative ask prices found"  = all(tick_raw$ask  > 0),
+  "Negative bid prices found"  = all(tick_raw$bid  > 0),
+  "Crossed quotes found (ask < bid)" = all(tick_raw$ask >= tick_raw$bid)
+)
+
+# Spread distribution — identifies stale or anomalous quotes
+tick_raw[, spread := ask - bid]
+cat("\nBid-ask spread summary (pence):\n")
+print(summary(tick_raw$spread))
+
+# Zero-spread quotes are unusual in quote data and may indicate stale ticks
+cat("Zero-spread quotes:", sum(tick_raw$spread == 0), "\n")
+```
+
+---
+
+## 6. Filter to Regular Trading Hours
+
+```{r filter-trading-hours}
+# We retain only regular LSE trading days and hours.
+# Trading window: 08:00:00 to 16:30:00 London time.
+# Weekdays only (Monday = 1, Friday = 5 with week_start = 1).
+
+# UK bank holidays in our sample window (source: Bank of England / LSE calendar)
+# These days have no regular trading and must be excluded.
+uk_holidays_2020 <- as.Date(c(
+  "2020-04-10",  # Good Friday
+  "2020-04-13",  # Easter Monday
+  "2020-05-08",  # VE Day bank holiday (special 2020)
+  "2020-05-25"   # Spring bank holiday
+))
+
+# Add date column for filtering
+tick_raw[, date := as.Date(timestamp, tz = "Europe/London")]
+
+# Numeric intraday time in seconds from midnight — faster and safer than
+# string comparison (avoids format-dependent fragility on large datasets)
+tick_raw[, intraday_sec := hour(timestamp) * 3600L +
+                           minute(timestamp) * 60L +
+                           as.integer(second(timestamp))]
+
+open_sec  <- 8L  * 3600L           # 08:00:00
+close_sec <- 16L * 3600L + 30L * 60L  # 16:30:00
+
+tick_clean <- tick_raw[
+  wday(timestamp, week_start = 1) <= 5 &     # Monday–Friday only
+  !(date %in% uk_holidays_2020)             & # exclude bank holidays
+  intraday_sec >= open_sec                  & # at or after 08:00
+  intraday_sec <= close_sec                   # at or before 16:30
+]
+
+cat("Rows before filter:", format(nrow(tick_raw),   big.mark = ","), "\n")
+cat("Rows after filter: ", format(nrow(tick_clean), big.mark = ","), "\n")
+cat("Rows removed:      ", format(nrow(tick_raw) - nrow(tick_clean), big.mark = ","), "\n")
+```
+
+```{r filter-verification}
+# Verify the filter worked correctly
+stopifnot(all(wday(tick_clean$timestamp, week_start = 1) <= 5))
+stopifnot(!any(tick_clean$date %in% uk_holidays_2020))
+
+time_range <- range(tick_clean$intraday_sec)
+cat("Intraday time range:", time_range[1], "to", time_range[2], "seconds\n")
+cat("  = ", sprintf("%02d:%02d", time_range[1] %/% 3600, (time_range[1] %% 3600) %/% 60),
+    "to", sprintf("%02d:%02d", time_range[2] %/% 3600, (time_range[2] %% 3600) %/% 60), "\n")
+
+cat("Trading days covered:", uniqueN(tick_clean$date), "\n")
+cat("Date range:", format(min(tick_clean$date)), "to", format(max(tick_clean$date)), "\n")
+```
+
+---
+
+## 7. Intraday Clock
+
+```{r intraday-clock}
+# Compute seconds elapsed since 08:00:00 (market open) for each tick.
+# We anchor to a FIXED 08:00:00 reference — NOT the first observed tick of the day.
+# Using the first tick would give different origins on different days
+# (e.g. a quiet day where first tick arrives at 08:00:45).
+
+tick_clean[, trading_seconds := intraday_sec - open_sec]
+
+# Sanity: trading_seconds must be >= 0 and <= 30600 (8.5 hours × 3600)
+stopifnot(all(tick_clean$trading_seconds >= 0))
+stopifnot(all(tick_clean$trading_seconds <= 30600))
+```
+```{r sub-second-precision}
+head(format(tick_raw$timestamp, "%Y-%m-%d %H:%M:%OS6"), 10)
+```
+
+---
+
+## 8. Mid-Price Construction
+
+```{r mid-price}
+# We use the quote mid-price as our price proxy.
+# Mid-price = (ask + bid) / 2
+# This reduces bid-ask bounce compared to using either side alone.
+# All subsequent returns and durations are based on this series.
+
+tick_clean[, mid := (ask + bid) / 2]
+
+# Drop the spread column computed earlier (was for diagnostics only)
+tick_clean[, spread := NULL]
+
+# Reorder columns for readability
+setcolorder(tick_clean, c("timestamp", "date", "trading_seconds",
+                          "bid", "ask", "mid",
+                          "bid_volume", "ask_volume"))
+```
+
+---
+
+## 9. Month Split
+
+```{r month-split}
+# Split into training (April) and test (May, June) sets.
+# All ACD and GARCH models are fitted on April only.
+# May and June are strictly out-of-sample.
+
+tick_clean[, month := format(date, "%Y-%m")]
+
+tick_apr <- tick_clean[month == "2020-04"]
+tick_may <- tick_clean[month == "2020-05"]
+tick_jun <- tick_clean[month == "2020-06"]
+
+stopifnot(nrow(tick_apr) > 0, nrow(tick_may) > 0, nrow(tick_jun) > 0)
+
+cat(sprintf("%-12s %10s %8s\n", "Month", "Ticks", "Days"))
+cat(sprintf("%-12s %10s %8s\n", "April",
+            format(nrow(tick_apr), big.mark=","),
+            uniqueN(tick_apr$date)))
+cat(sprintf("%-12s %10s %8s\n", "May",
+            format(nrow(tick_may), big.mark=","),
+            uniqueN(tick_may$date)))
+cat(sprintf("%-12s %10s %8s\n", "June",
+            format(nrow(tick_jun), big.mark=","),
+            uniqueN(tick_jun$date)))
+```
+
+---
+
+## 10. Event Definition and Duration Construction
+
+```{r make-event-function}
+# Events = midquote changes.
+# We filter out volume-only quote updates (where ask and bid don't move).
+# This is the correct event definition for a quote-based dataset.
+#
+# For each event we compute:
+#   duration  = seconds since the previous event (within the same trading day)
+#   ret_mid   = log return of the mid-price since the previous event
+#
+# The by = date grouping ensures we never compute a duration or return
+# that spans overnight — the first event of each day is correctly dropped.
+
+make_event_data <- function(dt) {
+  dt <- data.table::copy(dt)
+  data.table::setorder(dt, date, timestamp)
+
+  # Keep only rows where the mid-price changed since the previous tick.
+  # shift() produces NA for the first row of the full table — this row
+  # is naturally excluded by the != comparison (NA != anything = NA = FALSE).
+  dt <- dt[mid != data.table::shift(mid)]
+
+  # Inter-event duration in seconds, computed within each trading day.
+  # shift() within by = date gives NA for the first event of each day,
+  # which we then drop along with any zero-duration ties.
+  dt[, duration := as.numeric(
+    difftime(timestamp, data.table::shift(timestamp), units = "secs")
+  ), by = date]
+  dt <- dt[!is.na(duration) & duration > 0]
+
+  # Event-time log return of the mid-price.
+  # Computed within each day so overnight gaps don't contaminate returns.
+  dt[, ret_mid := c(NA_real_, diff(log(mid))), by = date]
+  dt <- dt[!is.na(ret_mid)]
+
+  dt[]
+}
+
+evt_apr <- make_event_data(tick_apr)
+evt_may <- make_event_data(tick_may)
+evt_jun <- make_event_data(tick_jun)
+
+cat(sprintf("%-12s %10s\n", "Month", "Events"))
+cat(sprintf("%-12s %10s\n", "April",  format(nrow(evt_apr), big.mark=",")))
+cat(sprintf("%-12s %10s\n", "May",    format(nrow(evt_may), big.mark=",")))
+cat(sprintf("%-12s %10s\n", "June",   format(nrow(evt_jun), big.mark=",")))
+```
+# NOTE: ~0.89% of April ticks removed as volume-only updates (symmetric 
+# bid-ask moves that leave mid unchanged). Low rate expected — Dukascopy 
+# pre-filters feed to bid/ask change events only.
+# NOTE: Duration floor at ~50ms likely reflects LSE Minimum Quote Life (MQL)
+# requirement. Affects ~25% of durations. Relevant for ACD shape parameter.
+
+```{r event-sanity-checks}
+# All durations must be strictly positive and finite
+stopifnot(
+  "Non-positive durations in April events" = all(evt_apr$duration > 0),
+  "Non-finite durations in April events"   = all(is.finite(evt_apr$duration)),
+  "Non-finite returns in April events"     = all(is.finite(evt_apr$ret_mid))
+)
+
+cat("April duration summary (seconds):\n")
+print(summary(evt_apr$duration))
+
+cat("\nApril return summary:\n")
+print(summary(evt_apr$ret_mid))
+```
+
+---
+
+## 11. Exploratory Analysis
+
+```{r daily-event-counts}
+# Events per trading day — helps us spot thin trading days or data gaps
+evt_counts_apr <- evt_apr[, .N, by = date][order(date)]
+
+ggplot(evt_counts_apr, aes(x = date, y = N)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(
+    title    = "Midquote-change events per trading day — April 2020",
+    subtitle = "Each bar = one trading day. Low counts may indicate thin markets or data gaps.",
+    x = "Date", y = "Number of events"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r duration-distribution}
+# Duration distribution on log scale — we expect a right-skewed distribution
+# consistent with Weibull or Burr innovations (not Exponential).
+# The shape here motivates the Weibull ACD specification in notebook 04.
+
+ggplot(evt_apr, aes(x = duration)) +
+  geom_histogram(bins = 120, fill = "steelblue", alpha = 0.7, colour = "white") +
+  scale_x_log10() +
+  labs(
+    title    = "Distribution of inter-event durations — April 2020 (log scale)",
+    subtitle = "Right skew and heavy tail are expected in high-frequency duration data.",
+    x        = "Duration (seconds, log scale)",
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r midquote-path}
+# Visual check of the mid-price path on one representative day.
+# If timestamps or the intraday clock are wrong, this plot will look broken.
+
+sample_date <- as.Date("2020-04-01")
+
+ggplot(tick_clean[date == sample_date], aes(x = trading_seconds / 3600, y = mid)) +
+  geom_line(colour = "steelblue", linewidth = 0.4) +
+  scale_x_continuous(
+    breaks = 0:8,
+    labels = function(x) sprintf("%02d:%02d", 8L + as.integer(x), 0L)
+  ) +
+  labs(
+    title    = paste("BP plc mid-price —", sample_date),
+    subtitle = "Source: Dukascopy best bid/ask quotes. Events = midquote changes.",
+    x        = "London time",
+    y        = "Mid-price (GBX)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r duration-tail-quantiles}
+# Extreme duration quantiles — these will inform the winsorisation bounds
+# we set in notebook 03. The 99.9th and 99.99th percentile values are
+# particularly relevant for detecting outlier gaps.
+cat("April duration quantiles (seconds):\n")
+print(quantile(evt_apr$duration, probs = c(0.25, 0.5, 0.75, 0.95, 0.99, 0.999, 0.9999)))
+```
+
+```{r intraday-activity-pattern}
+# Average number of events per 5-minute bucket across all April trading days.
+# This reveals the intraday seasonality in market activity — a key stylised
+# fact that motivates the diurnal adjustment in notebook 03.
+# We expect high activity at open (08:00-09:00), declining through midday,
+# and a secondary peak near close (15:30-16:30).
+
+# Assign each event to a 5-minute bucket (0 to 101 for 8.5 hours)
+evt_apr[, bucket_5m := trading_seconds %/% 300L]
+
+# Average events per bucket across all trading days
+activity_profile <- evt_apr[, .N, by = .(date, bucket_5m)][
+  , .(avg_events = mean(N)), by = bucket_5m][order(bucket_5m)]
+
+# Convert bucket index back to a readable time label
+activity_profile[, time_label := sprintf("%02d:%02d",
+  8L + (bucket_5m * 5L) %/% 60L,
+  (bucket_5m * 5L) %% 60L)]
+
+ggplot(activity_profile, aes(x = bucket_5m, y = avg_events)) +
+  geom_line(colour = "steelblue", linewidth = 0.7) +
+  geom_smooth(se = FALSE, colour = "firebrick", linewidth = 0.5, linetype = "dashed") +
+  scale_x_continuous(
+    breaks = seq(0, 100, by = 12),
+    labels = activity_profile$time_label[seq(1, nrow(activity_profile), by = 12)]
+  ) +
+  labs(
+    title    = "Average intraday activity profile — April 2020",
+    subtitle = "Average midquote-change events per 5-minute bucket across all trading days.\nPronounced diurnal pattern motivates seasonality adjustment in notebook 03.",
+    x        = "London time",
+    y        = "Avg events per 5-min bucket"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r acf-durations}
+# ACF of raw durations — tests whether consecutive durations are serially correlated.
+# Significant autocorrelation (positive, decaying slowly) is the empirical
+# justification for the ACD model: durations are NOT iid.
+# If ACF were flat at zero, there would be no need for an ACD model.
+
+# Use a sample for speed (full 1.26M series takes time); first 10,000 events
+# captures the autocorrelation structure clearly
+acf_result <- acf(
+  evt_apr$duration[1:10000],
+  lag.max = 50,
+  plot    = FALSE
+)
+
+acf_df <- data.frame(
+  lag = acf_result$lag[-1],
+  acf = acf_result$acf[-1]
+)
+
+ci <- qnorm(0.975) / sqrt(10000)  # 95% confidence band
+
+ggplot(acf_df, aes(x = lag, y = acf)) +
+  geom_hline(yintercept = 0, colour = "black", linewidth = 0.4) +
+  geom_hline(yintercept =  ci, colour = "firebrick", linetype = "dashed") +
+  geom_hline(yintercept = -ci, colour = "firebrick", linetype = "dashed") +
+  geom_segment(aes(xend = lag, yend = 0), colour = "steelblue") +
+  geom_point(size = 1.5, colour = "steelblue") +
+  labs(
+    title    = "ACF of inter-event durations — April 2020 (first 10,000 events)",
+    subtitle = "Significant positive autocorrelation confirms duration clustering.\nDashed lines = 95% confidence band under iid null.",
+    x        = "Lag",
+    y        = "Autocorrelation"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r return-distribution}
+# Return distribution vs normal — shows fat tails and excess kurtosis.
+# This visually motivates the Student-t innovation distribution
+# in the GARCH specifications in notebook 06.
+
+ret_vals <- evt_apr$ret_mid
+ret_mean <- mean(ret_vals)
+ret_sd   <- sd(ret_vals)
+
+ggplot(data.frame(ret = ret_vals), aes(x = ret)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 150, fill = "steelblue", alpha = 0.6, colour = "white") +
+  stat_function(
+    fun  = dnorm,
+    args = list(mean = ret_mean, sd = ret_sd),
+    colour = "firebrick", linewidth = 0.8
+  ) +
+  coord_cartesian(xlim = c(-0.003, 0.003)) +
+  labs(
+    title    = "Distribution of event-time log returns — April 2020",
+    subtitle = sprintf("Red = fitted Normal(μ=%.2e, σ=%.2e). Heavy tails relative to normal motivate Student-t GARCH.",
+                       ret_mean, ret_sd),
+    x        = "Log return (event-time)",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Print kurtosis — excess kurtosis >> 0 confirms fat tails
+cat(sprintf("Excess kurtosis of April returns: %.2f (Normal = 0)\n",
+            moments::kurtosis(ret_vals) - 3))
+cat(sprintf("Skewness: %.4f\n", moments::skewness(ret_vals)))
+```
+```{r}
+evt_apr[, bucket_5m := NULL]
+```
+
+---
+
+## 12. Save Outputs
+
+```{r save-outputs}
+# We save the clean tick data and all three event-time series.
+# Subsequent notebooks read these .rds files, so that they never re-read the raw CSV.
+# .rds preserves all R object attributes (data.table keys, POSIXct timezone, etc.)
+
+saveRDS(tick_clean, here::here("data", "processed", "tick_clean.rds"))
+saveRDS(evt_apr,    here::here("data", "processed", "events_apr.rds"))
+saveRDS(evt_may,    here::here("data", "processed", "events_may.rds"))
+saveRDS(evt_jun,    here::here("data", "processed", "events_jun.rds"))
+
+cat("Saved:\n")
+cat("  data/processed/tick_clean.rds  —", format(nrow(tick_clean), big.mark=","), "rows\n")
+cat("  data/processed/events_apr.rds  —", format(nrow(evt_apr),    big.mark=","), "rows\n")
+cat("  data/processed/events_may.rds  —", format(nrow(evt_may),    big.mark=","), "rows\n")
+cat("  data/processed/events_jun.rds  —", format(nrow(evt_jun),    big.mark=","), "rows\n")
+```
