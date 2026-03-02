@@ -1,0 +1,446 @@
+---
+title: "03 — Cleaning & Intraday Seasonality Removal"
+subtitle: "ACD-GARCH Intraday Volatility & Market Risk Forecasting — BP LSE Tick Data"
+author: "Sourodeep Roy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+## Purpose
+
+This notebook prepares the event-time duration series for ACD modelling through
+two steps:
+
+1. **Upper-tail winsorisation** — caps extreme durations using April-calibrated
+   bounds to stabilise parameter estimation without distorting the bulk of the
+   distribution.
+
+2. **Intraday seasonality removal** — removes the time-of-day (diurnal) pattern
+   from durations using a non-parametric median profile estimated on April only
+   and applied unchanged to May and June.
+
+Both steps use **April-calibrated parameters only**. No information from May or
+June is used in any cleaning or adjustment decision. This is essential for
+maintaining a leakage-free backtest.
+
+- **Inputs:**
+  - `data/processed/events_apr.rds`
+  - `data/processed/events_may.rds`
+  - `data/processed/events_jun.rds`
+- **Outputs:**
+  - `data/processed/events_apr_clean.rds`
+  - `data/processed/events_may_clean.rds`
+  - `data/processed/events_jun_clean.rds`
+
+---
+
+## 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(lubridate)
+  library(ggplot2)
+  library(here)
+})
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+evt_apr <- readRDS(here::here("data", "processed", "events_apr.rds"))
+evt_may <- readRDS(here::here("data", "processed", "events_may.rds"))
+evt_jun <- readRDS(here::here("data", "processed", "events_jun.rds"))
+
+cat("Loaded:\n")
+cat(sprintf("  events_apr: %s rows, %d trading days\n",
+            format(nrow(evt_apr), big.mark=","), uniqueN(evt_apr$date)))
+cat(sprintf("  events_may: %s rows, %d trading days\n",
+            format(nrow(evt_may), big.mark=","), uniqueN(evt_may$date)))
+cat(sprintf("  events_jun: %s rows, %d trading days\n",
+            format(nrow(evt_jun), big.mark=","), uniqueN(evt_jun$date)))
+```
+
+```{r pre-checks}
+# Verify the data is in the expected state before any cleaning.
+# These checks ensure notebook 02 outputs haven't been corrupted.
+
+required_cols <- c("timestamp", "date", "bid", "ask", "mid",
+                   "ret_mid", "duration", "trading_seconds")
+
+for (nm in c("evt_apr", "evt_may", "evt_jun")) {
+  dt <- get(nm)
+  missing <- setdiff(required_cols, names(dt))
+  if (length(missing) > 0)
+    stop(nm, " is missing columns: ", paste(missing, collapse = ", "))
+}
+
+# Durations must be strictly positive and finite going into cleaning
+stopifnot(all(evt_apr$duration > 0), all(is.finite(evt_apr$duration)))
+stopifnot(all(evt_apr$ask >= evt_apr$bid))
+
+# Timestamps correctly ordered within days
+n_reversals <- evt_apr[,
+  sum(diff(as.numeric(timestamp)) < 0), by = date][, sum(V1)]
+stopifnot("Timestamp reversals found in April" = n_reversals == 0)
+
+cat("Pre-checks passed.\n")
+cat("\nApril duration tail (before cleaning):\n")
+print(quantile(evt_apr$duration,
+               probs = c(0.95, 0.99, 0.995, 0.999, 0.9999)))
+```
+
+---
+
+## 3. Upper-Tail Winsorisation
+
+### Design rationale
+
+Duration distributions in high-frequency data have a heavy right tail — long
+gaps during lunch, after large news events, or at the end of the day. These
+extreme values inflate the ACD log-likelihood and can destabilise parameter
+estimation without representing genuine market microstructure dynamics.
+
+We cap durations at the **99.5th percentile of April**. This removes the top
+0.5% of the most extreme gaps while leaving the bulk of the distribution
+unchanged. Crucially:
+
+- The cap threshold is estimated on **April only**
+- The same fixed threshold is applied to May and June
+- We do **not** cap the lower tail — the ~50ms floor is a genuine
+  market microstructure feature (LSE Minimum Quote Life), not an outlier
+
+```{r winsorise}
+# Estimate the upper cap on April training data only
+upper_alpha <- 0.995
+dur_cap <- as.numeric(quantile(evt_apr$duration, probs = upper_alpha,
+                               na.rm = TRUE))
+
+cat(sprintf("April upper duration cap (%.1f%% quantile): %.4f seconds\n",
+            upper_alpha * 100, dur_cap))
+
+# Apply the April-derived cap to all three months.
+# pmin() replaces any duration exceeding the cap with the cap value.
+# We create duration_w (winsorised) and log_duration_w as new columns,
+# leaving the original duration column intact for reference.
+
+apply_upper_cap <- function(dt, cap) {
+  dt <- data.table::copy(dt)
+  stopifnot(is.finite(cap), cap > 0)
+  dt[, duration_w     := pmin(duration, cap)]
+  dt[, log_duration_w := log(duration_w)]
+  dt[]
+}
+
+evt_apr_clean <- apply_upper_cap(evt_apr, dur_cap)
+evt_may_clean <- apply_upper_cap(evt_may, dur_cap)
+evt_jun_clean <- apply_upper_cap(evt_jun, dur_cap)
+
+# Report how many observations hit the cap in each month.
+# For April this should be ~0.5% by construction.
+# May/June may differ — that is expected and acceptable.
+cap_report <- rbindlist(list(
+  data.table(Month = "April", N = nrow(evt_apr_clean),
+             Capped = sum(evt_apr_clean$duration_w == dur_cap)),
+  data.table(Month = "May",   N = nrow(evt_may_clean),
+             Capped = sum(evt_may_clean$duration_w == dur_cap)),
+  data.table(Month = "June",  N = nrow(evt_jun_clean),
+             Capped = sum(evt_jun_clean$duration_w == dur_cap))
+))
+cap_report[, Pct_Capped := round(100 * Capped / N, 3)]
+print(cap_report)
+```
+
+```{r winsorise-plot}
+# Compare raw vs winsorised duration distributions on log scale.
+# The only difference should be visible at the far right tail.
+# The bulk of the distribution should be identical.
+
+plot_data <- rbind(
+  data.table(duration = evt_apr$duration,         series = "Raw"),
+  data.table(duration = evt_apr_clean$duration_w, series = "Winsorised")
+)
+
+ggplot(plot_data, aes(x = duration, fill = series)) +
+  geom_histogram(bins = 120, alpha = 0.6, position = "identity",
+                 colour = "white") +
+  scale_x_log10() +
+  scale_fill_manual(values = c("Raw" = "steelblue",
+                               "Winsorised" = "firebrick")) +
+  labs(
+    title    = "April durations: raw vs winsorised (log scale)",
+    subtitle = sprintf("Upper cap at %.4fs (99.5th percentile of April). Only far right tail affected.",
+                       dur_cap),
+    x        = "Duration (seconds, log scale)",
+    y        = "Count",
+    fill     = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+## 4. Intraday Seasonality Removal
+
+### Why seasonality removal is necessary
+
+The intraday activity profile in notebook 02 showed a clear U-shaped pattern:
+high activity (short durations) at the open and close, and lower activity
+(long durations) around midday. If this diurnal pattern is not removed, the
+ACD model will partially fit the time-of-day pattern rather than the genuine
+clustering dynamics we want to capture.
+
+### Why non-parametric (NP) median profile over FFF
+
+Two approaches are common in the literature:
+
+**Flexible Fourier Form (FFF):** fits a parametric harmonic regression to the
+diurnal shape. Requires assumptions about the functional form and number of
+harmonics (tuning parameter Q).
+
+**Non-parametric (NP) median profile:** computes the median duration within
+each time-of-day bucket. No functional form assumptions. Robust to outliers
+within each bucket (median vs mean). Simple and transparent.
+
+We choose NP for three reasons:
+1. No parametric assumptions about the shape of the diurnal curve
+2. Median is robust — a few extreme durations in a bucket don't distort the profile
+3. The April 2020 diurnal pattern (confirmed in notebook 02) is irregular enough
+   that a parametric harmonic approximation would require many terms to capture
+   the 14:30 US open spike
+
+**Critical leakage note:** The NP profile is estimated on **April data only**.
+The same fixed profile is then applied to May and June without any refitting.
+Estimating a separate profile for May or June would use test-set information
+to adjust the data — a form of data leakage that would overstate performance.
+
+```{r add-tod-fields}
+# Add time-of-day fields needed for the diurnal profile.
+# We use 30-minute buckets (17 buckets across the 08:00-16:30 trading day).
+
+add_tod_fields <- function(dt) {
+  dt <- data.table::copy(dt)
+  dt[, tod_min   := hour(timestamp) * 60L + minute(timestamp)]
+  dt[, bucket_30m := floor(tod_min / 30L) * 30L]
+  dt[, bucket_time := sprintf("%02d:%02d",
+                              bucket_30m %/% 60L,
+                              bucket_30m %% 60L)]
+  dt[]
+}
+
+evt_apr_clean <- add_tod_fields(evt_apr_clean)
+evt_may_clean <- add_tod_fields(evt_may_clean)
+evt_jun_clean <- add_tod_fields(evt_jun_clean)
+```
+
+```{r np-profile}
+# Estimate the NP diurnal profile on April only.
+# Step 1: median winsorised duration within each 30-minute bucket
+# Step 2: normalise scale factors to mean 1 so the adjusted series
+#         has the same average duration as the original
+
+apr_profile <- evt_apr_clean[, .(
+  med_dur = median(duration_w, na.rm = TRUE),
+  n_events = .N
+), by = .(bucket_30m, bucket_time)][order(bucket_30m)]
+
+# Normalise: scale_factor > 1 means the bucket is slow (long durations)
+#            scale_factor < 1 means the bucket is fast (short durations)
+apr_profile[, scale_factor := med_dur / mean(med_dur, na.rm = TRUE)]
+
+cat("April NP diurnal profile (30-min buckets):\n")
+print(apr_profile[, .(bucket_time, med_dur = round(med_dur, 4),
+                      scale_factor = round(scale_factor, 4), n_events)])
+```
+
+```{r apply-np-profile}
+# Apply the April-calibrated profile to all three months.
+# duration_adj_np = duration_w / scale_factor
+# This divides out the expected diurnal component, leaving only
+# the genuine clustering dynamics for the ACD model to capture.
+#
+# We use an in-place join to add scale_factor without reordering columns.
+
+apply_np_adjustment <- function(dt, profile) {
+  dt <- data.table::copy(dt)
+
+  # In-place join: add scale_factor from profile matched on bucket_30m
+  dt[profile, on = "bucket_30m", scale_factor := i.scale_factor]
+
+  # If any bucket has no match (shouldn't happen, but defensive)
+  n_missing <- sum(is.na(dt$scale_factor))
+  if (n_missing > 0) {
+    warning(n_missing, " rows have no diurnal profile match — scale_factor set to 1")
+    dt[is.na(scale_factor), scale_factor := 1]
+  }
+
+  dt[, duration_adj_np    := duration_w / scale_factor]
+  dt[, log_duration_adj_np := log(duration_adj_np)]
+  dt[]
+}
+
+evt_apr_clean <- apply_np_adjustment(evt_apr_clean, apr_profile)
+evt_may_clean <- apply_np_adjustment(evt_may_clean, apr_profile)
+evt_jun_clean <- apply_np_adjustment(evt_jun_clean, apr_profile)
+
+cat("NP adjustment applied to April, May, June using April-calibrated profile.\n")
+```
+
+```{r diurnal-before-after}
+# Visual check: diurnal pattern before and after NP adjustment on April.
+# If adjustment worked, the time-of-day variation should largely flatten.
+
+diurnal_compare <- evt_apr_clean[, .(
+  Before = mean(duration_w,       na.rm = TRUE),
+  After  = mean(duration_adj_np,  na.rm = TRUE)
+), by = .(bucket_30m, bucket_time)][order(bucket_30m)]
+
+diurnal_long <- melt(
+  diurnal_compare,
+  id.vars      = c("bucket_30m", "bucket_time"),
+  measure.vars = c("Before", "After"),
+  variable.name = "Series",
+  value.name    = "Mean_Duration"
+)
+
+ggplot(diurnal_long,
+       aes(x = bucket_time, y = Mean_Duration,
+           group = Series, linetype = Series, colour = Series)) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = c("Before" = "steelblue",
+                                 "After"  = "firebrick")) +
+  labs(
+    title    = "April diurnal pattern: before vs after NP adjustment",
+    subtitle = "After adjustment the time-of-day variation should be substantially reduced.",
+    x        = "London time (30-min buckets)",
+    y        = "Mean duration (seconds)",
+    linetype = "", colour = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r variance-reduction}
+# Numeric summary of the variance reduction achieved by seasonality removal.
+# A good diurnal adjustment should meaningfully reduce log-duration variance.
+# We report variance of log-durations (standard in the ACD literature).
+
+var_raw <- var(evt_apr_clean$log_duration_w,       na.rm = TRUE)
+var_adj <- var(evt_apr_clean$log_duration_adj_np,  na.rm = TRUE)
+
+var_table <- data.table(
+  Series              = c("Log(winsorised duration)",
+                          "Log(NP-adjusted duration)"),
+  Variance            = round(c(var_raw, var_adj), 6),
+  Reduction_vs_Raw_pct = round(100 * (1 - c(var_raw, var_adj) / var_raw), 2)
+)
+print(var_table)
+```
+
+---
+
+## 5. ACF After Adjustment
+
+```{r acf-comparison}
+# We compare the ACF of log-durations before and after NP adjustment.
+# Goal: confirm that the diurnal pattern has been removed from the
+# autocorrelation structure, and that genuine duration clustering remains.
+#
+# If the pre-adjustment ACF was driven purely by the diurnal pattern,
+# it would disappear after adjustment. If it persists (as we expect),
+# it confirms genuine ACD-type clustering that the model needs to capture.
+
+compute_acf_df <- function(x, lag_max = 50, n_label) {
+  a <- acf(x[1:min(10000, length(x))], lag.max = lag_max, plot = FALSE)
+  data.table(
+    lag    = as.integer(a$lag[-1]),
+    acf    = as.numeric(a$acf[-1]),
+    series = n_label
+  )
+}
+
+acf_before <- compute_acf_df(evt_apr_clean$log_duration_w,      lag_max=50, "Before adjustment")
+acf_after  <- compute_acf_df(evt_apr_clean$log_duration_adj_np, lag_max=50, "After adjustment")
+acf_all    <- rbind(acf_before, acf_after)
+
+ci <- qnorm(0.975) / sqrt(10000)
+
+ggplot(acf_all, aes(x = lag, y = acf, colour = series)) +
+  geom_hline(yintercept = 0,   colour = "black",    linewidth = 0.3) +
+  geom_hline(yintercept =  ci, colour = "firebrick", linetype = "dashed") +
+  geom_hline(yintercept = -ci, colour = "firebrick", linetype = "dashed") +
+  geom_segment(aes(xend = lag, yend = 0),
+               position = position_dodge(width = 0.5)) +
+  geom_point(size = 1.5,
+             position = position_dodge(width = 0.5)) +
+  facet_wrap(~series, ncol = 1) +
+  scale_colour_manual(values = c("Before adjustment" = "steelblue",
+                                 "After adjustment"  = "firebrick")) +
+  labs(
+    title    = "ACF of log-durations before and after NP adjustment — April 2020",
+    subtitle = "Clustering autocorrelation should persist after adjustment (justifies ACD model).\nDashed lines = 95% CI under iid null.",
+    x = "Lag", y = "Autocorrelation",
+    colour = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 6. Final Series Selection
+
+```{r final-series}
+# We designate NP-adjusted log-durations as the modelling series.
+# This is the series fed into the Weibull ACD(2,2) in notebook 04.
+
+# Assign clean, unambiguous column names for downstream use
+evt_apr_clean[, duration_final     := duration_adj_np]
+evt_may_clean[, duration_final     := duration_adj_np]
+evt_jun_clean[, duration_final     := duration_adj_np]
+
+evt_apr_clean[, log_duration_final := log_duration_adj_np]
+evt_may_clean[, log_duration_final := log_duration_adj_np]
+evt_jun_clean[, log_duration_final := log_duration_adj_np]
+
+# Final summary of the modelling series
+cat("Final modelling series (duration_final) — April summary:\n")
+print(summary(evt_apr_clean$duration_final))
+cat(sprintf("\nLog-duration variance after full cleaning: %.6f\n",
+            var(evt_apr_clean$log_duration_final)))
+```
+
+---
+
+## 7. Save Outputs
+
+```{r save-outputs}
+saveRDS(evt_apr_clean, here::here("data", "processed", "events_apr_clean.rds"))
+saveRDS(evt_may_clean, here::here("data", "processed", "events_may_clean.rds"))
+saveRDS(evt_jun_clean, here::here("data", "processed", "events_jun_clean.rds"))
+
+# Also save the April diurnal profile — needed if we want to inspect or
+# reproduce the adjustment without re-running this notebook
+saveRDS(apr_profile, here::here("data", "processed", "apr_diurnal_profile.rds"))
+
+cat("Saved:\n")
+cat("  data/processed/events_apr_clean.rds —",
+    format(nrow(evt_apr_clean), big.mark=","), "rows\n")
+cat("  data/processed/events_may_clean.rds —",
+    format(nrow(evt_may_clean), big.mark=","), "rows\n")
+cat("  data/processed/events_jun_clean.rds —",
+    format(nrow(evt_jun_clean), big.mark=","), "rows\n")
+cat("  data/processed/apr_diurnal_profile.rds — April NP profile\n")
+```
