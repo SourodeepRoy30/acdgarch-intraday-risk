@@ -256,6 +256,31 @@ setcolorder(tick_clean, c("timestamp", "date", "trading_seconds",
 
 ## 9. Month Split
 
+### Train / Test Split Design
+
+We use **April 2020 as the training period** and **May–June 2020 as the 
+out-of-sample test period**. This design is justified on four grounds:
+
+1. **No look-ahead bias:** A risk manager at end-April would have access 
+   only to April data. Our design replicates this exactly.
+
+2. **Economic severity:** April 2020 captures the peak of the COVID oil 
+   price crash (Brent crude went negative on April 20). Training on the 
+   most volatile month and testing on calmer conditions is a conservative 
+   and credible design — the model is not given an easy test.
+
+3. **Statistical sufficiency:** April provides 1,264,699 events across 
+   20 trading days — far more than needed to identify ACD(2,2) and 
+   GARCH(1,1) parameters reliably.
+
+4. **Literature precedent:** Single fixed-window training with rolling 
+   out-of-sample evaluation is standard in the ACD and high-frequency 
+   GARCH literature (Engle & Russell 1998; Andersen & Bollerslev 1998).
+
+All model parameters are estimated on April only. No refitting occurs 
+on May or June data. ACD recursion and GARCH rolling forecasts for 
+May–June use April-estimated parameters exclusively.
+
 ```{r month-split}
 # Split into training (April) and test (May, June) sets.
 # All ACD and GARCH models are fitted on April only.
