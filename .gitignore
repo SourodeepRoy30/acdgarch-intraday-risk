@@ -1,0 +1,28 @@
+# R
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+
+# renv
+renv/library/
+renv/staging/
+
+# Knitr generated outputs
+notebooks/*.html
+notebooks/*.pdf
+notebooks/*_cache/
+notebooks/*_files/
+
+# Large data files (keep only the sample)
+data/raw/*.csv
+!data/raw/BPGBGBX_Ticks_2020.04.01_2020.04.01.csv
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+*.swp
