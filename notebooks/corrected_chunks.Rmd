@@ -1,0 +1,162 @@
+```{r add-tod-fields}
+# Time-of-day bucket assignment using 5-minute intervals.
+# bucket_5m is computed RELATIVE TO MARKET OPEN (08:00 = bucket 0).
+# This ensures:
+#   bucket 0   = 08:00–08:05
+#   bucket 17  = 09:25–09:30
+#   bucket 101 = 16:25–16:30
+# The relative indexing keeps bucket numbers intuitive and ensures the
+# label formula produces correct clock times.
+
+add_tod_fields <- function(dt) {
+  dt <- data.table::copy(dt)
+
+  # Total seconds since midnight
+  dt[, tod_sec := hour(timestamp) * 3600L +
+                  minute(timestamp) * 60L +
+                  as.integer(second(timestamp))]
+
+  # Seconds since market open (08:00:00 = 28800 seconds since midnight)
+  open_sec <- 8L * 3600L   # 28800
+
+  # 5-minute bucket relative to open: 0 = 08:00, 1 = 08:05, ..., 101 = 16:25
+  dt[, bucket_5m := (tod_sec - open_sec) %/% 300L]
+
+  # Readable clock label: bucket 0 = "08:00", bucket 12 = "09:00", etc.
+  dt[, bucket_time := sprintf("%02d:%02d",
+                               8L + (bucket_5m * 5L) %/% 60L,
+                               (bucket_5m * 5L) %% 60L)]
+
+  # Drop intermediate column
+  dt[, tod_sec := NULL]
+  dt[]
+}
+
+evt_apr_clean <- add_tod_fields(evt_apr_clean)
+evt_may_clean <- add_tod_fields(evt_may_clean)
+evt_jun_clean <- add_tod_fields(evt_jun_clean)
+
+# Verify bucket range is 0–101 (102 buckets across 8.5-hour trading day)
+cat("April bucket_5m range:", min(evt_apr_clean$bucket_5m),
+    "to", max(evt_apr_clean$bucket_5m), "\n")
+cat("Expected: 0 to 101\n")
+
+# Spot check a few known times
+cat("\nSpot checks:\n")
+cat("First event bucket_time:", evt_apr_clean$bucket_time[1], "(should be 08:xx)\n")
+```
+
+
+```{r np-profile}
+# NP median profile using 5-minute buckets.
+# Finer granularity is necessary here because the 14:30 US market open
+# spike is sharp and confined to a narrow window — a 30-minute bucket
+# averages over both the spike and its decay, leaving substantial
+# within-bucket diurnal variation unexplained.
+# 5-minute buckets give 102 intervals across the 08:00-16:30 trading day.
+
+apr_profile <- evt_apr_clean[, .(
+  med_dur  = median(duration_w, na.rm = TRUE),
+  n_events = .N
+), by = .(bucket_5m, bucket_time)][order(bucket_5m)]
+
+apr_profile[, scale_factor := med_dur / mean(med_dur, na.rm = TRUE)]
+
+cat("Profile buckets:", nrow(apr_profile), "\n")
+cat("Min scale factor:", round(min(apr_profile$scale_factor), 4),
+    "at", apr_profile[which.min(scale_factor), bucket_time], "\n")
+cat("Max scale factor:", round(max(apr_profile$scale_factor), 4),
+    "at", apr_profile[which.max(scale_factor), bucket_time], "\n")
+
+print(apr_profile[, .(bucket_time,
+                      med_dur      = round(med_dur, 4),
+                      scale_factor = round(scale_factor, 4),
+                      n_events)])
+```
+
+
+```{r apply-np-adjustment}
+apply_np_adjustment <- function(dt, profile) {
+  dt <- data.table::copy(dt)
+
+  dt[profile, on = "bucket_5m", scale_factor := i.scale_factor]
+
+  n_missing <- sum(is.na(dt$scale_factor))
+  if (n_missing > 0) {
+    warning(n_missing, " rows have no diurnal profile match — scale_factor set to 1")
+    dt[is.na(scale_factor), scale_factor := 1]
+  }
+
+  dt[, duration_adj_np     := duration_w / scale_factor]
+  dt[, log_duration_adj_np := log(duration_adj_np)]
+  dt[]
+}
+
+evt_apr_clean <- apply_np_adjustment(evt_apr_clean, apr_profile)
+evt_may_clean <- apply_np_adjustment(evt_may_clean, apr_profile)
+evt_jun_clean <- apply_np_adjustment(evt_jun_clean, apr_profile)
+
+cat("NP adjustment applied to April, May, June using April-calibrated profile.\n")
+```
+
+
+```{r diurnal-before-after}
+# Visual check: diurnal pattern before and after NP adjustment on April.
+# If adjustment worked, the time-of-day variation should largely flatten.
+# X-axis shows hourly labels only (every 12th bucket) to keep plot readable.
+
+diurnal_compare <- evt_apr_clean[, .(
+  Before = mean(duration_w,      na.rm = TRUE),
+  After  = mean(duration_adj_np, na.rm = TRUE)
+), by = .(bucket_5m, bucket_time)][order(bucket_5m)]
+
+diurnal_long <- melt(
+  diurnal_compare,
+  id.vars       = c("bucket_5m", "bucket_time"),
+  measure.vars  = c("Before", "After"),
+  variable.name = "Series",
+  value.name    = "Mean_Duration"
+)
+
+# Show only hourly tick marks (every 12 buckets = 60 minutes)
+# to avoid x-axis overcrowding with 102 labels
+hourly_breaks  <- diurnal_compare$bucket_5m[seq(1, nrow(diurnal_compare), by = 12)]
+hourly_labels  <- diurnal_compare$bucket_time[seq(1, nrow(diurnal_compare), by = 12)]
+
+ggplot(diurnal_long,
+       aes(x = bucket_5m, y = Mean_Duration,
+           group = Series, linetype = Series, colour = Series)) +
+  geom_line(linewidth = 0.8) +
+  scale_x_continuous(breaks = hourly_breaks, labels = hourly_labels) +
+  scale_colour_manual(values = c("Before" = "steelblue",
+                                 "After"  = "firebrick")) +
+  labs(
+    title    = "April diurnal pattern: before vs after NP adjustment",
+    subtitle = "After adjustment the time-of-day variation should be substantially reduced.",
+    x        = "London time (5-min buckets, hourly labels)",
+    y        = "Mean duration (seconds)",
+    linetype = "", colour = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r variance-reduction}
+# Numeric summary of the variance reduction achieved by seasonality removal.
+# A good diurnal adjustment should meaningfully reduce log-duration variance.
+# We report variance of log-durations (standard in the ACD literature).
+# With 5-minute buckets we expect 10-30% reduction vs the 1.6% seen with
+# 30-minute buckets.
+
+var_raw <- var(evt_apr_clean$log_duration_w,      na.rm = TRUE)
+var_adj <- var(evt_apr_clean$log_duration_adj_np, na.rm = TRUE)
+
+var_table <- data.table(
+  Series               = c("Log(winsorised duration)",
+                            "Log(NP-adjusted, 5-min buckets)"),
+  Variance             = round(c(var_raw, var_adj), 6),
+  Reduction_vs_Raw_pct = round(100 * (1 - c(var_raw, var_adj) / var_raw), 2)
+)
+print(var_table)
+```
