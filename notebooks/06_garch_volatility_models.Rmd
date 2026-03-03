@@ -1,0 +1,550 @@
+---
+title: "Notebook 06 — GARCH Volatility Estimation and OOS Forecasting"
+author: "Sourodeep Roy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r nb06_setup, message=FALSE, warning=FALSE}
+library(data.table)
+library(ggplot2)
+library(rugarch)
+library(sandwich)   # NeweyWest
+library(lmtest)     # coeftest
+
+# ── Anchor all paths to project root ────────────────────────────────────────
+proj_root <- rprojroot::find_rstudio_root_file()
+
+# ── Load 5-min objects produced by notebook 05 ──────────────────────────────
+r5_apr <- readRDS(file.path(proj_root, "data/processed/r5_apr.rds"))
+r5_may <- readRDS(file.path(proj_root, "data/processed/r5_may.rds"))
+r5_jun <- readRDS(file.path(proj_root, "data/processed/r5_jun.rds"))
+
+# Confirm required columns
+req_cols <- c("r_raw_5m", "r_ia_5m_sum", "r_ia_5m_inv", "psi_5m", "scale_5m")
+stopifnot(all(req_cols %in% names(r5_apr)),
+          all(req_cols %in% names(r5_may)),
+          all(req_cols %in% names(r5_jun)))
+
+cat("Project root:", proj_root, "\n")
+cat("Rows: Apr =", nrow(r5_apr), "| May =", nrow(r5_may), "| Jun =", nrow(r5_jun), "\n")
+```
+
+```{r nb06_series_setup, message=FALSE, warning=FALSE}
+# ── VOLATILITY TRACK (for GARCH fitting + forecast evaluation) ───────────────
+# r_ia_5m_sum: sum of event-level IA returns per 5-min bucket.
+# This is the denoised series whose variance GARCH should model more cleanly
+# after activity-driven heteroskedasticity has been removed by the ACD scaling.
+
+r_apr_raw_vol <- as.numeric(r5_apr$r_raw_5m)
+r_apr_ia_vol  <- as.numeric(r5_apr$r_ia_5m_sum)
+
+r_may_raw_vol <- as.numeric(r5_may$r_raw_5m)
+r_may_ia_vol  <- as.numeric(r5_may$r_ia_5m_sum)
+
+r_jun_raw_vol <- as.numeric(r5_jun$r_raw_5m)
+r_jun_ia_vol  <- as.numeric(r5_jun$r_ia_5m_sum)
+
+stopifnot(
+  all(is.finite(r_apr_raw_vol)), all(is.finite(r_apr_ia_vol)),
+  all(is.finite(r_may_raw_vol)), all(is.finite(r_may_ia_vol)),
+  all(is.finite(r_jun_raw_vol)), all(is.finite(r_jun_ia_vol))
+)
+
+cat("Volatility track lengths:\n")
+cat("Apr raw:", length(r_apr_raw_vol), "| Apr IA-sum:", length(r_apr_ia_vol), "\n")
+cat("May raw:", length(r_may_raw_vol), "| May IA-sum:", length(r_may_ia_vol), "\n")
+cat("Jun raw:", length(r_jun_raw_vol), "| Jun IA-sum:", length(r_jun_ia_vol), "\n")
+```
+
+```{r nb06_clustering_diagnostics, message=FALSE, warning=FALSE}
+# ── DIAGNOSTIC 1: ACF of squared returns ─────────────────────────────────────
+# Significant positive autocorrelation in r² is the empirical signature of
+# GARCH effects. We expect IA-sum to show weaker but still present clustering
+# after the activity adjustment — the residual clustering is what GARCH models.
+
+op <- par(mfrow = c(1, 2))
+acf(r_apr_raw_vol^2, lag.max = 100,
+    main = "April ACF(r²) — Raw, 5-min")
+acf(r_apr_ia_vol^2,  lag.max = 100,
+    main = "April ACF(r²) — IA-sum, 5-min")
+par(op)
+
+# ── DIAGNOSTIC 2: ARCH-LM test (Engle 1982) ──────────────────────────────────
+# Standard pre-GARCH check. Ljung-Box on squared returns at multiple lags.
+# Rejection confirms ARCH effects are present and justifies GARCH modelling.
+
+arch_lm <- function(r, lags = c(5, 10, 20)) {
+  r2 <- as.numeric(r)^2
+  rbindlist(lapply(lags, function(l) {
+    bt <- Box.test(r2, lag = l, type = "Ljung-Box")
+    data.table(lag = l, stat = round(bt$statistic, 3), p_value = round(bt$p.value, 6))
+  }))
+}
+
+cat("ARCH-LM (Ljung-Box on r²) — April RAW:\n")
+print(arch_lm(r_apr_raw_vol))
+cat("\nARCH-LM (Ljung-Box on r²) — April IA-sum:\n")
+print(arch_lm(r_apr_ia_vol))
+
+# ── DIAGNOSTIC 3: Absolute returns time-series ───────────────────────────────
+dt_abs <- rbindlist(list(
+  data.table(t = seq_along(r_apr_raw_vol), abs_r = abs(r_apr_raw_vol), Series = "Raw"),
+  data.table(t = seq_along(r_apr_ia_vol),  abs_r = abs(r_apr_ia_vol),  Series = "IA-sum")
+))
+
+ggplot(dt_abs, aes(x = t, y = abs_r)) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(~Series, ncol = 1, scales = "free_y") +
+  labs(title = "April (5-min): absolute returns — volatility clustering",
+       x = "5-min bucket index", y = "|r|") +
+  theme_minimal()
+```
+
+```{r nb06_model_selection, message=FALSE, warning=FALSE}
+# ── MODEL SELECTION: compare three standard GARCH specifications ──────────────
+# Practitioners and researchers routinely compare sGARCH, eGARCH, and GJR-GARCH
+# to account for asymmetric leverage effects (negative returns increase vol more
+# than positive returns of equal magnitude). Student-t innovations are the
+# baseline for high-frequency financial returns given heavy tails.
+# Selection criterion: BIC (penalises parameters more aggressively than AIC).
+
+garch_specs <- list(
+  sGARCH_std   = ugarchspec(
+    variance.model     = list(model = "sGARCH",   garchOrder = c(1, 1)),
+    mean.model         = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = "std"),
+  eGARCH_std   = ugarchspec(
+    variance.model     = list(model = "eGARCH",   garchOrder = c(1, 1)),
+    mean.model         = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = "std"),
+  gjrGARCH_std = ugarchspec(
+    variance.model     = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+    mean.model         = list(armaOrder = c(0, 0), include.mean = FALSE),
+    distribution.model = "std")
+)
+
+fit_and_ic <- function(spec, data, label) {
+  fit <- ugarchfit(spec, data = data, solver = "hybrid")
+  if (fit@fit$convergence != 0) {
+    warning("Non-convergence: ", label)
+    return(NULL)
+  }
+  ic <- infocriteria(fit)
+  list(label = label, fit = fit,
+       AIC = ic["Akaike", ], BIC = ic["Bayes", ])
+}
+
+# Fit all three specs on April RAW
+res_raw <- lapply(seq_along(garch_specs), function(i)
+  fit_and_ic(garch_specs[[i]], r_apr_raw_vol, names(garch_specs)[i]))
+res_raw <- Filter(Negate(is.null), res_raw)
+
+# Fit all three specs on April IA-sum
+res_ia <- lapply(seq_along(garch_specs), function(i)
+  fit_and_ic(garch_specs[[i]], r_apr_ia_vol, names(garch_specs)[i]))
+res_ia <- Filter(Negate(is.null), res_ia)
+
+# Information criteria table
+ic_raw <- rbindlist(lapply(res_raw, function(x)
+  data.table(Track = "Raw",    Model = x$label,
+             AIC = round(x$AIC, 4), BIC = round(x$BIC, 4))))
+ic_ia  <- rbindlist(lapply(res_ia, function(x)
+  data.table(Track = "IA-sum", Model = x$label,
+             AIC = round(x$AIC, 4), BIC = round(x$BIC, 4))))
+
+ic_table <- rbindlist(list(ic_raw, ic_ia))
+setorder(ic_table, Track, BIC)
+cat("Model selection (April training; lower BIC preferred):\n")
+print(ic_table)
+
+# Select best spec per track by BIC
+best_raw <- res_raw[[which.min(sapply(res_raw, `[[`, "BIC"))]]
+best_ia  <- res_ia [[which.min(sapply(res_ia,  `[[`, "BIC"))]]
+
+cat("\nSelected: RAW =>", best_raw$label, "| IA-sum =>", best_ia$label, "\n")
+
+spec_raw_best <- garch_specs[[best_raw$label]]
+spec_ia_best  <- garch_specs[[best_ia$label]]
+fit_raw_vol   <- best_raw$fit
+fit_ia_vol    <- best_ia$fit
+
+cat("\nRAW fit coefficients:\n");    print(round(coef(fit_raw_vol), 6))
+cat("\nIA-sum fit coefficients:\n"); print(round(coef(fit_ia_vol),  6))
+```
+
+```{r nb06_oos_sigma, message=FALSE, warning=FALSE}
+# ── OOS SIGMA: freeze April parameters, filter May/Jun ───────────────────────
+# Correct approach: fit only on April, lock parameters with setfixed(), then
+# use ugarchfilter() to propagate the variance equation through OOS months.
+# This strictly prevents any look-ahead leakage and mirrors what a practitioner
+# would do at month-end: freeze the model, run it forward on new data.
+
+oos_sigma_fixed <- function(fit_obj, r_oos) {
+  r_oos <- as.numeric(r_oos)
+  stopifnot(all(is.finite(r_oos)), length(r_oos) > 0)
+
+  spec_fx <- getspec(fit_obj)
+  setfixed(spec_fx) <- as.list(coef(fit_obj))
+
+  flt <- ugarchfilter(spec_fx, data = r_oos)
+  sig <- as.numeric(sigma(flt))
+
+  stopifnot(all(is.finite(sig)), all(sig > 0), length(sig) == length(r_oos))
+  sig
+}
+
+# May
+sigma_raw_may <- oos_sigma_fixed(fit_raw_vol, r_may_raw_vol)
+sigma_ia_may  <- oos_sigma_fixed(fit_ia_vol,  r_may_ia_vol)
+
+# Jun
+sigma_raw_jun <- oos_sigma_fixed(fit_raw_vol, r_jun_raw_vol)
+sigma_ia_jun  <- oos_sigma_fixed(fit_ia_vol,  r_jun_ia_vol)
+
+cat("OOS sigma lengths:\n")
+cat("May: raw =", length(sigma_raw_may), "| ia =", length(sigma_ia_may), "\n")
+cat("Jun: raw =", length(sigma_raw_jun), "| ia =", length(sigma_ia_jun), "\n")
+
+# ── Visual sanity: smoothed r² vs σ² (May, 4-hour rolling window) ─────────────
+k <- 48  # 48 × 5 min = 4 hours
+
+dt_ck <- data.table(
+  t      = seq_along(r_may_raw_vol),
+  rv_raw = r_may_raw_vol^2,
+  v_raw  = sigma_raw_may^2,
+  rv_ia  = r_may_ia_vol^2,
+  v_ia   = sigma_ia_may^2
+)
+dt_ck[, rv_raw_s := zoo::rollmean(rv_raw, k = k, fill = NA, align = "right")]
+dt_ck[, rv_ia_s  := zoo::rollmean(rv_ia,  k = k, fill = NA, align = "right")]
+
+p1 <- ggplot(dt_ck, aes(x = t)) +
+  geom_line(aes(y = rv_raw_s, colour = "Realised (smoothed)"),
+            linewidth = 0.5, na.rm = TRUE) +
+  geom_line(aes(y = v_raw, colour = "GARCH forecast"),
+            linewidth = 0.5) +
+  scale_colour_manual(
+    values = c("Realised (smoothed)" = "steelblue", "GARCH forecast" = "tomato")) +
+  labs(title = "May OOS (Raw): smoothed r² vs GARCH σ²",
+       x = "5-min bucket index", y = "Variance", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+p2 <- ggplot(dt_ck, aes(x = t)) +
+  geom_line(aes(y = rv_ia_s, colour = "Realised (smoothed)"),
+            linewidth = 0.5, na.rm = TRUE) +
+  geom_line(aes(y = v_ia, colour = "GARCH forecast"),
+            linewidth = 0.5) +
+  scale_colour_manual(
+    values = c("Realised (smoothed)" = "steelblue", "GARCH forecast" = "tomato")) +
+  labs(title = "May OOS (IA-sum): smoothed r² vs GARCH σ²",
+       x = "5-min bucket index", y = "Variance", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+print(p1)
+print(p2)
+```
+
+```{r nb06_vol_scores, message=FALSE, warning=FALSE}
+# ── LOSS FUNCTIONS: QLIKE and MSE on variance ─────────────────────────────────
+# QLIKE (Patton 2011) is the dominant loss function in the volatility forecasting
+# literature because it is robust to noise in the realised proxy (here r²).
+# It penalises over-prediction and under-prediction asymmetrically in a way
+# that is consistent with the true (unobservable) variance as the target.
+# MSE on variance is included as a standard complement.
+
+score_vol <- function(r, sigma_hat, label) {
+  rv   <- pmax(as.numeric(r)^2,         1e-12)
+  vhat <- pmax(as.numeric(sigma_hat)^2, 1e-12)
+  data.table(
+    Sample  = label,
+    MSE_Var = mean((rv - vhat)^2,         na.rm = TRUE),
+    QLIKE   = mean(log(vhat) + rv / vhat, na.rm = TRUE)
+  )
+}
+
+scores <- rbindlist(list(
+  score_vol(r_may_raw_vol, sigma_raw_may, "May (Raw)"),
+  score_vol(r_may_ia_vol,  sigma_ia_may,  "May (IA-sum)"),
+  score_vol(r_jun_raw_vol, sigma_raw_jun, "Jun (Raw)"),
+  score_vol(r_jun_ia_vol,  sigma_ia_jun,  "Jun (IA-sum)")
+))
+print(scores)
+
+# Improvement table (positive % = IA better)
+imp <- data.table(Month = c("May", "Jun"))
+imp[, MSE_Raw   := c(scores[Sample == "May (Raw)",    MSE_Var],
+                     scores[Sample == "Jun (Raw)",    MSE_Var])]
+imp[, MSE_IA    := c(scores[Sample == "May (IA-sum)", MSE_Var],
+                     scores[Sample == "Jun (IA-sum)", MSE_Var])]
+imp[, QLIKE_Raw := c(scores[Sample == "May (Raw)",    QLIKE],
+                     scores[Sample == "Jun (Raw)",    QLIKE])]
+imp[, QLIKE_IA  := c(scores[Sample == "May (IA-sum)", QLIKE],
+                     scores[Sample == "Jun (IA-sum)", QLIKE])]
+imp[, MSE_Improvement_Pct   := 100 * (MSE_Raw   - MSE_IA)   / MSE_Raw]
+imp[, QLIKE_Improvement_Pct := 100 * (QLIKE_Raw - QLIKE_IA) / abs(QLIKE_Raw)]
+
+cat("\nIA improvement vs Raw (positive = IA better):\n")
+print(imp[, .(Month, MSE_Raw, MSE_IA, MSE_Improvement_Pct,
+              QLIKE_Raw, QLIKE_IA, QLIKE_Improvement_Pct)])
+```
+
+```{r nb06_mz_regression, message=FALSE, warning=FALSE}
+# ── MINCER–ZARNOWITZ REGRESSION ───────────────────────────────────────────────
+# Standard in the volatility forecasting literature (Hansen & Lunde 2005,
+# Patton 2011). Regress realised proxy (r²) on forecast variance (σ²):
+#   r²_t = α + β·σ²_t + ε_t
+# Efficient forecast: α = 0, β = 1.
+# HAC standard errors (Newey-West) correct for serial correlation in residuals.
+# β < 1: model over-predicts variance spikes.
+# β > 1: model under-predicts variance spikes.
+# R²: how much variation in realised variance the forecast explains.
+
+mz_test <- function(r, sigma_hat, label) {
+  rv   <- as.numeric(r)^2
+  vhat <- as.numeric(sigma_hat)^2
+
+  fit <- lm(rv ~ vhat)
+  L   <- floor(length(rv)^(1/3))
+  V   <- NeweyWest(fit, lag = L, prewhite = FALSE, adjust = TRUE)
+  ct  <- coeftest(fit, vcov. = V)
+
+  alpha_hat <- ct[1, 1]; alpha_p <- ct[1, 4]
+  beta_hat  <- ct[2, 1]; beta_p  <- ct[2, 4]
+  r2        <- summary(fit)$r.squared
+
+  # Joint Wald test H0: alpha=0, beta=1
+  b <- coef(fit) - c(0, 1)
+  W <- as.numeric(t(b) %*% solve(V) %*% b)
+  p_joint <- 1 - pchisq(W, df = 2)
+
+  data.table(
+    Sample    = label,
+    alpha_hat = round(alpha_hat, 8), alpha_p = round(alpha_p, 4),
+    beta_hat  = round(beta_hat,  4), beta_p  = round(beta_p,  4),
+    R2        = round(r2, 4),
+    W_joint   = round(W, 3),         p_joint = round(p_joint, 4)
+  )
+}
+
+mz <- rbindlist(list(
+  mz_test(r_may_raw_vol, sigma_raw_may, "May (Raw)"),
+  mz_test(r_may_ia_vol,  sigma_ia_may,  "May (IA-sum)"),
+  mz_test(r_jun_raw_vol, sigma_raw_jun, "Jun (Raw)"),
+  mz_test(r_jun_ia_vol,  sigma_ia_jun,  "Jun (IA-sum)")
+))
+
+cat("Mincer-Zarnowitz regression (HAC SEs):\n")
+print(mz)
+cat("\n  beta closer to 1 => better calibrated forecast\n")
+cat("  p_joint < 0.05   => reject forecast efficiency (alpha=0, beta=1)\n")
+```
+
+```{r nb06_dm_hac_vol, message=FALSE, warning=FALSE}
+# ── DIEBOLD–MARIANO TEST (HAC) ────────────────────────────────────────────────
+# d_t = Loss_raw(t) - Loss_ia(t)
+# H1: mean(d) > 0  =>  IA-sum has lower loss than Raw (one-sided test).
+# Newey-West HAC standard errors correct for serial correlation in d_t.
+# HAC lag: T^(1/3) rule-of-thumb (Andrews 1991).
+
+eps <- 1e-12
+
+loss_series <- function(r, sigma_hat, loss = c("QLIKE", "MSE_Var")) {
+  loss <- match.arg(loss)
+  rv   <- pmax(as.numeric(r)^2,         eps)
+  vhat <- pmax(as.numeric(sigma_hat)^2, eps)
+  switch(loss,
+    QLIKE   = log(vhat) + rv / vhat,
+    MSE_Var = (rv - vhat)^2
+  )
+}
+
+dm_hac <- function(d, L = NULL, alternative = c("greater", "two.sided")) {
+  alternative <- match.arg(alternative)
+  d <- as.numeric(na.omit(d))
+  T <- length(d)
+  stopifnot(T > 30)
+  if (is.null(L)) L <- floor(T^(1/3))
+
+  fit <- lm(d ~ 1)
+  V   <- NeweyWest(fit, lag = L, prewhite = FALSE, adjust = TRUE)
+  ct  <- coeftest(fit, vcov. = V)
+
+  est   <- as.numeric(ct[1, 1])
+  tstat <- as.numeric(ct[1, 3])
+  pval  <- if (alternative == "greater") {
+    1 - pt(tstat, df = T - 1)
+  } else {
+    2 * (1 - pt(abs(tstat), df = T - 1))
+  }
+
+  data.table(T = T, HAC_lag = L, mean_d = est, t_stat = tstat, p_value = pval)
+}
+
+# Loss differentials
+d_may_qlike <- loss_series(r_may_raw_vol, sigma_raw_may, "QLIKE") -
+               loss_series(r_may_ia_vol,  sigma_ia_may,  "QLIKE")
+d_jun_qlike <- loss_series(r_jun_raw_vol, sigma_raw_jun, "QLIKE") -
+               loss_series(r_jun_ia_vol,  sigma_ia_jun,  "QLIKE")
+d_may_mse   <- loss_series(r_may_raw_vol, sigma_raw_may, "MSE_Var") -
+               loss_series(r_may_ia_vol,  sigma_ia_may,  "MSE_Var")
+d_jun_mse   <- loss_series(r_jun_raw_vol, sigma_raw_jun, "MSE_Var") -
+               loss_series(r_jun_ia_vol,  sigma_ia_jun,  "MSE_Var")
+
+dm_out <- rbindlist(list(
+  cbind(Month = "May", Loss = "QLIKE",   dm_hac(d_may_qlike, alternative = "greater")),
+  cbind(Month = "Jun", Loss = "QLIKE",   dm_hac(d_jun_qlike, alternative = "greater")),
+  cbind(Month = "May", Loss = "MSE_Var", dm_hac(d_may_mse,   alternative = "greater")),
+  cbind(Month = "Jun", Loss = "MSE_Var", dm_hac(d_jun_mse,   alternative = "greater"))
+))
+cat("DM-HAC tests (H1: IA-sum has lower loss than Raw):\n")
+print(dm_out)
+
+# Bucket-by-bucket win rate
+win_rate <- function(d) {
+  d <- as.numeric(na.omit(d))
+  data.table(T = length(d), WinRate_IA = mean(d > 0), TieRate = mean(d == 0))
+}
+
+wins <- rbindlist(list(
+  cbind(Month = "May", Loss = "QLIKE",   win_rate(d_may_qlike)),
+  cbind(Month = "Jun", Loss = "QLIKE",   win_rate(d_jun_qlike)),
+  cbind(Month = "May", Loss = "MSE_Var", win_rate(d_may_mse)),
+  cbind(Month = "Jun", Loss = "MSE_Var", win_rate(d_jun_mse))
+))
+cat("\nDirectional win-rate (share of buckets where IA has lower loss):\n")
+print(wins)
+```
+
+```{r nb06_robustness_ia_inv, message=FALSE, warning=FALSE}
+# ── ROBUSTNESS: IA-invertible track as alternative volatility series ──────────
+# IA-inv = r_raw_5m × scale_5m (invertible by construction, used in risk track).
+# We rerun the same best spec on this track to confirm results are not sensitive
+# to the choice of IA aggregation method (sum vs invertible).
+
+r_apr_ia_inv <- as.numeric(r5_apr$r_ia_5m_inv)
+r_may_ia_inv <- as.numeric(r5_may$r_ia_5m_inv)
+r_jun_ia_inv <- as.numeric(r5_jun$r_ia_5m_inv)
+
+stopifnot(all(is.finite(r_apr_ia_inv)),
+          all(is.finite(r_may_ia_inv)),
+          all(is.finite(r_jun_ia_inv)))
+
+fit_ia_inv <- ugarchfit(spec_ia_best, data = r_apr_ia_inv, solver = "hybrid")
+stopifnot(fit_ia_inv@fit$convergence == 0)
+
+sigma_iaInv_may <- oos_sigma_fixed(fit_ia_inv, r_may_ia_inv)
+sigma_iaInv_jun <- oos_sigma_fixed(fit_ia_inv, r_jun_ia_inv)
+
+score_inv <- rbindlist(list(
+  score_vol(r_may_ia_inv, sigma_iaInv_may, "May (IA-inv)"),
+  score_vol(r_jun_ia_inv, sigma_iaInv_jun, "Jun (IA-inv)")
+))
+
+# Side-by-side with IA-sum scores
+cmp <- rbindlist(list(
+  scores[grepl("IA", Sample),
+         .(Month = fifelse(grepl("May", Sample), "May", "Jun"),
+           Source = "IA-sum", MSE_Var, QLIKE)],
+  score_inv[,
+         .(Month = fifelse(grepl("May", Sample), "May", "Jun"),
+           Source = "IA-inv", MSE_Var, QLIKE)]
+), use.names = TRUE)
+setorder(cmp, Month, Source)
+
+cat("Robustness: IA-sum vs IA-inv (lower is better):\n")
+print(cmp)
+
+ggplot(cmp, aes(x = Month, y = QLIKE, fill = Source)) +
+  geom_col(position = "dodge") +
+  labs(title = "Robustness: IA-sum vs IA-inv (QLIKE, lower is better)",
+       x = NULL, y = "QLIKE", fill = "Aggregation method") +
+  theme_minimal()
+```
+
+```{r nb06_headline, message=FALSE, warning=FALSE}
+# ── HEADLINE TABLE ─────────────────────────────────────────────────────────────
+# Build cleanly from the scores object using separate dcast calls to avoid
+# column naming ambiguity from hyphenated level names.
+
+sc <- copy(scores)
+sc[, Month := fifelse(grepl("^May", Sample), "May", "Jun")]
+sc[, Type  := fifelse(grepl("IA",  Sample), "IA",  "Raw")]
+
+mse_w <- dcast(sc, Month ~ Type, value.var = "MSE_Var")
+setnames(mse_w, c("IA", "Raw"), c("MSE_IA", "MSE_Raw"))
+
+qlk_w <- dcast(sc, Month ~ Type, value.var = "QLIKE")
+setnames(qlk_w, c("IA", "Raw"), c("QLIKE_IA", "QLIKE_Raw"))
+
+vol_wide <- merge(mse_w, qlk_w, by = "Month")
+vol_wide[, MSE_Improvement_Pct   := 100 * (MSE_Raw   - MSE_IA)   / MSE_Raw]
+vol_wide[, QLIKE_Improvement_Pct := 100 * (QLIKE_Raw - QLIKE_IA) / abs(QLIKE_Raw)]
+vol_wide[, Month := factor(Month, levels = c("May", "Jun"))]
+setorder(vol_wide, Month)
+
+# Attach DM test results
+dm_q <- dm_out[Loss == "QLIKE",   .(Month, DM_t_QLIKE = t_stat, DM_p_QLIKE = p_value)]
+dm_m <- dm_out[Loss == "MSE_Var", .(Month, DM_t_MSE   = t_stat, DM_p_MSE   = p_value)]
+vol_headline <- Reduce(function(x, y) merge(x, y, by = "Month", all.x = TRUE),
+                       list(vol_wide, dm_q, dm_m))
+setorder(vol_headline, Month)
+
+cat("\n=== VOLATILITY FORECAST HEADLINE (OOS May/Jun; lower loss = better) ===\n")
+print(vol_headline[, .(
+  Month,
+  MSE_Raw    = format(MSE_Raw,  scientific = TRUE, digits = 3),
+  MSE_IA     = format(MSE_IA,   scientific = TRUE, digits = 3),
+  `MSE Δ%`   = round(MSE_Improvement_Pct,   2),
+  QLIKE_Raw  = round(QLIKE_Raw,  5),
+  QLIKE_IA   = round(QLIKE_IA,   5),
+  `QLIKE Δ%` = round(QLIKE_Improvement_Pct, 3),
+  DM_t_QLIKE = round(DM_t_QLIKE, 3),
+  DM_p_QLIKE = round(DM_p_QLIKE, 4)
+)])
+
+# Plots
+p_qlike <- ggplot(vol_headline, aes(x = Month, y = QLIKE_Improvement_Pct)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Volatility track: IA-sum vs Raw — QLIKE improvement (%)",
+       x = NULL, y = "QLIKE improvement (%)  [positive = IA better]") +
+  theme_minimal()
+
+p_mse <- ggplot(vol_headline, aes(x = Month, y = MSE_Improvement_Pct)) +
+  geom_col(fill = "tomato") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Volatility track: IA-sum vs Raw — MSE improvement (%)",
+       x = NULL, y = "MSE improvement (%)  [positive = IA better]") +
+  theme_minimal()
+
+print(p_qlike)
+print(p_mse)
+```
+
+```{r nb06_save, message=FALSE, warning=FALSE}
+# ── SAVE OUTPUTS for notebook 07 ─────────────────────────────────────────────
+saveRDS(list(
+  fit_raw_vol   = fit_raw_vol,
+  fit_ia_vol    = fit_ia_vol,
+  fit_ia_inv    = fit_ia_inv,
+  spec_raw_best = spec_raw_best,
+  spec_ia_best  = spec_ia_best,
+  sigma_raw_may = sigma_raw_may,
+  sigma_ia_may  = sigma_ia_may,
+  sigma_raw_jun = sigma_raw_jun,
+  sigma_ia_jun  = sigma_ia_jun,
+  scores        = scores,
+  dm_out        = dm_out,
+  wins          = wins,
+  vol_headline  = vol_headline
+), file.path(proj_root, "data/processed/nb06_outputs.rds"))
+
+cat("Saved: data/processed/nb06_outputs.rds\n")
+cat("Contents: fit objects, sigma series, scores, dm_out, wins, vol_headline\n")
+```
