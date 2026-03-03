@@ -1,89 +1,87 @@
-# Intensity-Adjusted Intraday Volatility & Market Risk Forecasting
-### ACD–GARCH Framework on High-Frequency BP plc LSE Tick Data (Apr–Jun 2020)
+# Intensity-Adjusted Intraday Volatility and Market Risk Forecasting
+### An ACD-GARCH Framework on High-Frequency BP plc Tick Data
 
-**MSc Data Science & Analytics Dissertation — University of Leeds (Distinction, 80%)**
-
-[![R](https://img.shields.io/badge/R-4.x-276DC3?logo=r)](https://www.r-project.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Language](https://img.shields.io/badge/language-R-276DC3?style=flat-square)](https://www.r-project.org/)
+[![Data](https://img.shields.io/badge/tick%20quotes-1.27M-blue?style=flat-square)]()
+[![Dissertation](https://img.shields.io/badge/MSc%20Dissertation-Distinction%2080%25-gold?style=flat-square)]()
 
 ---
 
 ## Overview
 
-This research tests whether incorporating **market activity intensity** (via ACD-modelled trade durations) improves out-of-sample volatility forecasting and market risk calibration for BP plc tick quotes on the London Stock Exchange.
+This repository contains the full research code for my MSc Data Science and Analytics dissertation at the **University of Leeds** (Distinction, 80%).
 
-The core idea: high-frequency volatility is driven not just by return magnitudes but by *when* trades occur. By modelling the conditional intensity of market events with a **Weibull ACD(2,2)** model, we construct intensity-adjusted returns that carry richer information about the volatility process than raw returns alone.
+The central question is: **does adjusting high-frequency returns for trading activity intensity produce better out-of-sample volatility and risk forecasts?**
 
-**Headline result:** Intensity-adjusted GARCH models achieved **69–72% lower out-of-sample MSE** and **4.8–5.7% better QLIKE** versus raw-return baselines, with improvements confirmed by Diebold–Mariano tests.
+Standard GARCH models treat all time intervals equally. But in high-frequency markets, a 5-minute window containing 30 trades carries fundamentally different information than one containing 3 trades. The **Autoregressive Conditional Duration (ACD)** model captures this variation in trading intensity, and we use it to construct *intensity-adjusted returns* — a denoised return series that isolates genuine price volatility from activity-driven noise.
+
+We then fit GARCH models on both the raw and intensity-adjusted series, compare out-of-sample volatility forecasts, and evaluate the resulting VaR and ES risk estimates against realised returns using formal statistical tests.
 
 ---
 
 ## Key Results
 
-### Volatility Forecasting (Out-of-Sample: May–Jun 2020, trained on April only)
+All models trained on **April 2024 only** and evaluated out-of-sample on **May and June 2024**.
 
-| Model | Track | MSE vs Baseline | QLIKE vs Baseline | DM Test |
-|---|---|---|---|---|
-| sGARCH-N (raw) | Baseline | — | — | — |
-| sGARCH-t (raw) | Raw | –12% | –1.1% | Significant |
-| **sGARCH-t (IA-adjusted)** | **IA-sum** | **–69%** | **–4.8%** | **p < 0.05** |
-| eGARCH-t (raw) | Raw | –15% | –1.4% | Significant |
-| **eGARCH-t (IA-adjusted)** | **IA-sum** | **–72%** | **–5.7%** | **p < 0.05** |
-| gjrGARCH-t (raw) | Raw | –11% | –1.0% | Significant |
-| **gjrGARCH-t (IA-adjusted)** | **IA-sum** | **–70%** | **–5.1%** | **p < 0.05** |
+### Volatility Forecasting
 
-*Realised proxy: 5-minute squared returns. Losses: MSE on variance, QLIKE.*
+| Metric | May | June |
+|---|---|---|
+| QLIKE improvement (IA vs Raw) | **+4.96%** | **+5.94%** |
+| MSE improvement (IA vs Raw) | **+75.7%** | **+80.4%** |
+| DM-HAC t-statistic (QLIKE) | **33.96** | **31.80** |
+| DM p-value | < 0.001 | < 0.001 |
+| Win rate (% of 5-min buckets where IA has lower loss) | 96.6% | 97.2% |
+
+The intensity-adjusted model achieves lower QLIKE loss in over **96% of individual 5-minute intervals** across both test months. The Diebold-Mariano test with Newey-West HAC standard errors confirms this improvement is statistically significant well beyond conventional levels.
 
 ### Market Risk (VaR/ES Backtesting)
 
-| Model | Confidence | Kupiec UC | Christoffersen CC | FZ0 Score |
-|---|---|---|---|---|
-| sGARCH-N (raw) | 95% | Fail | Fail | Higher |
-| sGARCH-t (raw) | 95% | Pass | Pass | Moderate |
-| **IA-sGARCH-t (invertible)** | **95%** | **Pass** | **Pass** | **Lower** |
-| **IA-eGARCH-t (invertible)** | **99%** | **Pass** | **Pass** | **Lower** |
-| FHS at 5% (IA) | 95% | Pass | Pass | Lowest |
+| Test | Result |
+|---|---|
+| Kupiec unconditional coverage | Both models conservative; formally rejected at 1% |
+| Christoffersen independence | **Passes for all specifications** — no clustering of breaches |
+| FHS ES cover ratio (5%) | **1.01–1.06** — accurate conditional tail estimation |
+| FZ0 DM-HAC t-statistic (1%) | **36.4** (May+Jun combined, p < 0.001) |
+| FZ0 DM-HAC t-statistic (5%) | **16.3** (May+Jun combined, p < 0.001) |
+| FZ0 win rate at 1% | **90–97%** of 5-min intervals |
 
-*IA risk forecasts mapped back to raw return scale via activity-scale inversion.*
+The IA-mapped model produces lower FZ0 joint VaR-ES loss in all 12 evaluation configurations. The conservative VaR coverage is a consequence of the single-month training design (April was more volatile than May-June), not a structural model failure — confirmed by the independence tests passing throughout.
 
 ---
 
 ## Methodology
 
-```
-Raw Tick Quotes (1.27M+)
-        │
-        ▼
-  Event Definition          ← midquote changes only
-  Duration & Return Series  ← inter-event times, log midquote returns
-        │
-        ▼
-  Seasonality Removal       ← NP median diurnal profile (April-calibrated)
-        │
-        ▼
-  Weibull ACD(2,2)          ← fitted on April, recursed OOS for May-Jun
-  → ψ̂_t (cond. duration)
-  → λ̂_t = 1/ψ̂_t (intensity)
-        │
-        ▼
-  Intensity-Adjusted Returns
-  r_IA = r_t × √ψ̂_t
-        │
-   ┌────┴────┐
-   ▼         ▼
-Track A      Track B
-(Volatility) (Risk)
-IA-sum 5min  IA-invertible 5min
-   │              │
-   ▼              ▼
-GARCH Family   VaR/ES via
-(sGARCH/eGARCH/ scale inversion
- gjrGARCH × N/t)
-   │              │
-   ▼              ▼
-MSE/QLIKE     Kupiec/Christoffersen
-DM Tests      FZ0 joint loss
-```
+### Data
+- **Asset:** BP plc ordinary shares (BP.L), London Stock Exchange
+- **Source:** Refinitiv Tick History
+- **Period:** April–June 2024
+- **Volume:** 1,270,000+ individual tick quotes
+- **Cleaning:** Zero-return filtering, overnight gap removal, exchange hours restriction (08:00–16:30 BST)
+
+### Step 1 — ACD Model (Notebooks 02–04)
+Trade durations (time between successive transactions) are modelled using a **Weibull ACD(2,2)** specification. The ACD model captures the intraday U-shaped pattern in trading activity (high at open and close, low at midday) and produces a conditional intensity measure ψ_t for each trade.
+
+### Step 2 — Intensity-Adjusted Returns (Notebook 05)
+Raw tick returns are scaled by the ACD intensity to produce two adjusted series:
+
+- **IA-sum:** event-level adjusted returns aggregated to 5-minute buckets (used for volatility track)
+- **IA-inv:** raw 5-minute returns multiplied by √ψ (invertible; used for risk track)
+
+The adjustment reduces the activity-volatility correlation by **31–44%** at the 5-minute level.
+
+### Step 3 — GARCH Estimation (Notebook 06)
+Three GARCH specifications (sGARCH, eGARCH, GJR-GARCH) with Student-t innovations are fitted on **April only**. Model selection via BIC selects **sGARCH(1,1)-t** for both tracks. April parameters are frozen and applied to May and June using `ugarchfilter()` — no look-ahead leakage. Forecast quality evaluated via QLIKE, MSE, Mincer-Zarnowitz regression, and DM-HAC tests.
+
+### Step 4 — VaR/ES Backtesting (Notebook 07)
+Risk forecasts constructed at two levels:
+
+- **1% parametric:** analytical Student-t multipliers applied to frozen-parameter GARCH sigma
+- **5% FHS (Filtered Historical Simulation):** empirical quantile of April standardised residuals scaled by OOS sigma (McNeil & Frey 2000)
+
+IA-model VaR/ES forecasts are mapped back to the raw return scale via the invertible ACD scaling: VaR_raw = VaR_IA / √ψ.
+
+Evaluation tests: **Kupiec (1995)** unconditional coverage, **Christoffersen (1998)** independence and conditional coverage, **FZ0 joint loss** (Fissler & Ziegel 2016), **DM-HAC** (Diebold & Mariano 1995 with Newey-West HAC), and **Clopper-Pearson** binomial confidence intervals.
 
 ---
 
@@ -92,92 +90,88 @@ DM Tests      FZ0 joint loss
 ```
 acdgarch-intraday-risk/
 │
-├── README.md
-├── environment.yml              ← R package dependencies
-├── .gitignore
-│
 ├── data/
-│   ├── BPGBGBX_Ticks_2020.04.01_sample.csv   ← 1-day sample (April 1)
-│   └── DATA_ACCESS.md                         ← full data description
+│   ├── raw/                    # Original tick data (not tracked — too large)
+│   └── processed/              # Intermediate .rds files (not tracked — reproducible from code)
 │
 ├── notebooks/
-│   ├── 01_data_preparation.Rmd          ← quotes → event-time series
-│   ├── 02_cleaning_seasonality.Rmd      ← winsorising, diurnal removal
-│   ├── 03_acd_model.Rmd                 ← Weibull ACD(2,2) estimation
-│   ├── 04_intensity_adjusted_returns.Rmd ← construct r_IA, aggregation tracks
-│   ├── 05_garch_volatility_models.Rmd   ← GARCH fitting and OOS forecasting
-│   ├── 06_volatility_evaluation.Rmd     ← MSE, QLIKE, DM tests
-│   └── 07_var_es_backtesting.Rmd        ← VaR/ES, Kupiec, CC, FZ0
+│   ├── 01_data_loading.Rmd           # Load and inspect raw tick data
+│   ├── 02_data_cleaning.Rmd          # Filter, clean, align tick quotes
+│   ├── 03_diurnal_adjustment.Rmd     # Intraday seasonality removal
+│   ├── 04_acd_model.Rmd              # Weibull ACD(2,2) estimation
+│   ├── 05_intensity_adjustment.Rmd   # Construct IA return series
+│   ├── 06_garch_volatility_models.Rmd # GARCH fitting, OOS forecasting, QLIKE/MSE
+│   └── 07_var_es_backtesting.Rmd     # VaR/ES construction, backtesting, FZ0
 │
-├── reports/
-│   ├── dissertation.pdf                 ← full MSc dissertation
-│   └── methodology_summary.pdf         ← 2-page accessible summary
-│
-└── results/
-    └── (model outputs, headline tables — generated by notebooks)
+└── README.md
 ```
+
+Notebooks must be run **in order (01 → 07)**. Each notebook saves its outputs to `data/processed/` for the next notebook to load.
 
 ---
 
-## How to Run
+## Reproducing the Results
 
-### Prerequisites
+### Requirements
 
-- R 4.x
-- RStudio (recommended) or any `.Rmd` renderer
-
-### Setup
+R version 4.3 or later. Install required packages:
 
 ```r
-# Install renv if not already installed
-install.packages("renv")
-
-# Restore the package environment
-renv::restore()
+install.packages(c(
+  "data.table",   # fast data manipulation
+  "ggplot2",      # visualisation
+  "rugarch",      # GARCH estimation
+  "ACDm",         # ACD model estimation
+  "sandwich",     # Newey-West HAC standard errors
+  "lmtest",       # coeftest with robust SEs
+  "zoo",          # rolling window functions
+  "rprojroot"     # project-relative file paths
+))
 ```
 
-### Running the notebooks
+### Running
 
-Run notebooks **in order** (01 → 07). Each notebook reads outputs from the previous stage. All paths are relative to the project root.
+1. Clone the repository:
+```bash
+git clone https://github.com/SourodeepRoy30/acdgarch-intraday-risk.git
+cd acdgarch-intraday-risk
+```
 
-> **Note on data:** Only a 1-day sample (April 1, 2020) is included in this repo. The full dataset covers April–June 2020 (1.27M+ tick quotes) sourced from Dukascopy. See `data/DATA_ACCESS.md` for details.
+2. Place the raw tick data file in `data/raw/` (see Data note below).
 
----
+3. Open the project in RStudio by double-clicking `acdgarch-intraday-risk.Rproj`.
 
-## Technical Stack
+4. Run notebooks 01 through 07 in order. Each notebook uses `rprojroot::find_rstudio_root_file()` to anchor file paths — no manual path editing required.
 
-| Component | Tools |
-|---|---|
-| Data processing | `data.table`, `lubridate` |
-| ACD modelling | `ACDm` |
-| GARCH modelling | `rugarch` |
-| Visualisation | `ggplot2`, `gridExtra` |
-| Statistical testing | Base R, custom HAC DM implementation |
+> **Data note:** The raw tick data was sourced from Refinitiv Tick History via the University of Leeds library subscription and cannot be redistributed. Contact the author for details on obtaining equivalent BP.L tick data.
 
 ---
 
-## Background and Motivation
+## Statistical Tests Reference
 
-The ACD model (Engle & Russell, 1998) treats inter-event durations as a conditionally heteroskedastic process — analogous to GARCH for returns. When market activity clusters (short durations = high intensity), the information content per unit time is higher. This motivates scaling returns by conditional intensity before fitting a GARCH model.
-
-The two-track aggregation design (IA-sum for volatility evaluation vs IA-invertible for risk mapping) ensures that both forecast accuracy and risk calibration are evaluated on a common, meaningful scale.
-
----
-
-## Academic Context
-
-This project was submitted as an MSc dissertation at the University of Leeds (2024), achieving a Distinction (80%). The methodology builds on:
-
-- Engle & Russell (1998) — ACD model
-- Bollerslev (1986), Nelson (1991), Glosten et al. (1993) — GARCH family
-- Diebold & Mariano (1995) — forecast comparison test
-- Kupiec (1995), Christoffersen (1998) — VaR backtesting
-- Fissler & Ziegel (2016) — FZ0 joint VaR-ES loss
+| Test | Purpose | Reference |
+|---|---|---|
+| Weibull ACD(2,2) | Model trade duration dynamics | Engle & Russell (1998) |
+| ARCH-LM (Ljung-Box on r²) | Pre-GARCH heteroskedasticity check | Engle (1982) |
+| Mincer-Zarnowitz regression | Forecast efficiency (α=0, β=1) | Patton (2011) |
+| QLIKE loss | Volatility forecast comparison | Patton (2011) |
+| Diebold-Mariano (HAC) | Forecast superiority test | Diebold & Mariano (1995) |
+| Kupiec LR test | Unconditional VaR coverage | Kupiec (1995) |
+| Christoffersen LR test | VaR hit independence | Christoffersen (1998) |
+| FZ0 loss | Joint VaR-ES evaluation | Fissler & Ziegel (2016) |
+| Filtered Historical Simulation | Non-parametric tail estimation | McNeil & Frey (2000) |
+| Clopper-Pearson CI | Binomial hit-rate confidence interval | Clopper & Pearson (1934) |
 
 ---
 
 ## Author
 
-**Sourodeep Roy**
-MSc Data Science & Analytics — University of Leeds (Distinction)
-[LinkedIn](https://www.linkedin.com/in/sourodeep-roy) | [GitHub](https://github.com/SourodeepRoy30)
+**Sourodeep Roy**  
+MSc Data Science and Analytics — University of Leeds (Distinction, 80%)  
+[GitHub](https://github.com/SourodeepRoy30) · [LinkedIn](https://www.linkedin.com/in/sourodeep-roy)
+
+---
+
+## Acknowledgements
+
+Dissertation supervised at the University of Leeds, School of Mathematics. Tick data accessed via the Refinitiv Eikon platform through the University of Leeds library.
