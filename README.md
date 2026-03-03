@@ -168,10 +168,6 @@ cd acdgarch-intraday-risk
 
 **Sourodeep Roy**  
 MSc Data Science and Analytics — University of Leeds (Distinction, 80%)  
-[GitHub](https://github.com/SourodeepRoy30) · [LinkedIn](https://www.linkedin.com/in/sourodeep-roy)
+[GitHub](https://github.com/SourodeepRoy30) · [LinkedIn](https://www.linkedin.com/in/sourodeeproy/)
 
----
 
-## Acknowledgements
-
-Dissertation supervised at the University of Leeds, School of Mathematics. Tick data accessed via the Refinitiv Eikon platform through the University of Leeds library.
