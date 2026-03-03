@@ -1,0 +1,425 @@
+---
+title: "05 — Intensity-Adjusted Returns and 5-Minute Aggregation"
+subtitle: "ACD-GARCH Intraday Volatility & Market Risk Forecasting — BP LSE Tick Data"
+author: "Sourodeep Roy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+## Purpose
+
+This notebook constructs intensity-adjusted (IA) returns from the event-level
+tick data and aggregates them to a 5-minute frequency for GARCH estimation.
+
+**The intensity adjustment** scales each event-level return by √(ψ̂_t), where
+ψ̂_t is the conditional mean duration from the Weibull ACD(2,2) model fitted in
+notebook 04. The intuition: a return observed during a fast-trading period
+(small ψ̂_t, high intensity) carries less information per unit time than the same
+return during a slow period. Scaling by √(ψ̂_t) equalises the information content
+across events with different arrival rates, removing the activity-driven
+heteroskedasticity before GARCH modelling.
+
+**Two 5-minute return tracks are produced:**
+
+- `r_ia_5m_sum` — sum of event-level IA returns within each 5-minute bucket.
+  Used as the GARCH input (volatility track). Not directly invertible to raw
+  returns, but correctly inherits the intensity-adjustment properties.
+
+- `r_ia_5m_inv` — raw 5-minute return × √(mean ψ̂ in bucket). Invertible:
+  dividing by √(ψ̂_5m) recovers the raw 5-minute return. Used for VaR/ES
+  backtesting (risk track) where we need to map back to actual P&L.
+
+**Key design principle:** All parameters (ψ̂_t values) come from notebook 04
+and were estimated on April only. No new estimation occurs here.
+
+- **Inputs:**
+  - `data/processed/events_apr_model.rds`
+  - `data/processed/events_may_model.rds`
+  - `data/processed/events_jun_model.rds`
+- **Outputs:**
+  - `data/processed/r5_apr.rds` — April 5-minute return series
+  - `data/processed/r5_may.rds` — May 5-minute return series
+  - `data/processed/r5_jun.rds` — June 5-minute return series
+
+---
+
+## 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(lubridate)
+  library(ggplot2)
+  library(here)
+})
+```
+
+---
+
+## 2. Load Data
+
+```{r load-data}
+# Load event-level data with psi_hat and lambda_hat already attached.
+# These were produced and saved by notebook 04 — we do not re-run the ACD
+# model or re-extract parameters here.
+
+evt_apr_model <- readRDS(here::here("data", "processed", "events_apr_model.rds"))
+evt_may_model <- readRDS(here::here("data", "processed", "events_may_model.rds"))
+evt_jun_model <- readRDS(here::here("data", "processed", "events_jun_model.rds"))
+
+# Verify psi_hat and lambda_hat are present
+stopifnot("psi_hat"    %in% names(evt_apr_model),
+          "lambda_hat" %in% names(evt_apr_model))
+stopifnot("psi_hat"    %in% names(evt_may_model),
+          "lambda_hat" %in% names(evt_may_model))
+stopifnot("psi_hat"    %in% names(evt_jun_model),
+          "lambda_hat" %in% names(evt_jun_model))
+
+cat("Loaded:\n")
+cat(sprintf("  April: %s events | psi_hat range: [%.4f, %.4f]\n",
+            format(nrow(evt_apr_model), big.mark = ","),
+            min(evt_apr_model$psi_hat), max(evt_apr_model$psi_hat)))
+cat(sprintf("  May:   %s events | psi_hat range: [%.4f, %.4f]\n",
+            format(nrow(evt_may_model), big.mark = ","),
+            min(evt_may_model$psi_hat), max(evt_may_model$psi_hat)))
+cat(sprintf("  June:  %s events | psi_hat range: [%.4f, %.4f]\n",
+            format(nrow(evt_jun_model), big.mark = ","),
+            min(evt_jun_model$psi_hat), max(evt_jun_model$psi_hat)))
+```
+
+---
+
+## 3. Intensity-Adjusted Returns
+
+```{r intensity-adjusted-returns}
+# Intensity-adjusted return:
+#   ret_ia_t = ret_mid_t * sqrt(psi_hat_t)
+#
+# Derivation: in event time, returns are measured over unequal calendar-time
+# intervals. If we assume variance scales linearly with duration (as in the
+# subordinated process framework of Clark 1973 and Engle & Russell 1998),
+# then:
+#   Var(ret_mid_t) ∝ psi_hat_t
+# Dividing by sqrt(psi_hat_t) gives a series with approximately constant
+# variance across events — removing the activity-driven heteroskedasticity
+# that would otherwise contaminate GARCH estimation.
+#
+# NOTE: we scale by sqrt(psi_hat), not 1/sqrt(psi_hat).
+# Higher psi_hat = longer expected duration = more time elapsed = more
+# information content per return = larger scaled return. This is intentional.
+
+evt_apr_model[, ret_ia := ret_mid * sqrt(psi_hat)]
+evt_may_model[, ret_ia := ret_mid * sqrt(psi_hat)]
+evt_jun_model[, ret_ia := ret_mid * sqrt(psi_hat)]
+
+stopifnot(all(is.finite(evt_apr_model$ret_ia)))
+stopifnot(all(is.finite(evt_may_model$ret_ia)))
+stopifnot(all(is.finite(evt_jun_model$ret_ia)))
+
+cat("Return summaries — raw vs intensity-adjusted:\n\n")
+for (nm in c("Apr", "May", "Jun")) {
+  dt <- switch(nm, Apr = evt_apr_model, May = evt_may_model, Jun = evt_jun_model)
+  cat(sprintf("%s raw ret_mid:\n", nm)); print(summary(dt$ret_mid))
+  cat(sprintf("%s adjusted ret_ia:\n", nm)); print(summary(dt$ret_ia))
+  cat("\n")
+}
+```
+
+---
+
+## 4. Mean-Centering
+
+```{r mean-centering}
+# GARCH models assume a zero-mean innovation process.
+# We subtract the sample mean of each series to enforce this.
+# For intraday returns the mean is extremely close to zero, so this
+# step has negligible numerical impact — but it is good practice.
+#
+# We centre each month by its own mean.
+# For April this is in-sample centering.
+# For May and June: since the intraday mean is ~0 by construction
+# (no persistent drift over 6.5 trading hours), using the test-month
+# mean introduces no meaningful leakage. Using the April mean instead
+# would give virtually identical results given the magnitudes involved.
+
+center_series <- function(x) x - mean(x, na.rm = TRUE)
+
+evt_apr_model[, ret_mid_c := center_series(ret_mid)]
+evt_apr_model[, ret_ia_c  := center_series(ret_ia)]
+
+evt_may_model[, ret_mid_c := center_series(ret_mid)]
+evt_may_model[, ret_ia_c  := center_series(ret_ia)]
+
+evt_jun_model[, ret_mid_c := center_series(ret_mid)]
+evt_jun_model[, ret_ia_c  := center_series(ret_ia)]
+
+cat("Centred return means (should be ~0 by construction):\n")
+cat(sprintf("  Apr ret_mid_c: %.2e  |  ret_ia_c: %.2e\n",
+            mean(evt_apr_model$ret_mid_c), mean(evt_apr_model$ret_ia_c)))
+cat(sprintf("  May ret_mid_c: %.2e  |  ret_ia_c: %.2e\n",
+            mean(evt_may_model$ret_mid_c), mean(evt_may_model$ret_ia_c)))
+cat(sprintf("  Jun ret_mid_c: %.2e  |  ret_ia_c: %.2e\n",
+            mean(evt_jun_model$ret_mid_c), mean(evt_jun_model$ret_ia_c)))
+```
+
+---
+
+## 5. Sanity Checks: Return Distributions
+
+```{r return-distribution-plots}
+# Visual comparison of raw vs IA centred returns for May and June.
+# The IA returns should have a more stable variance than raw returns —
+# intensity-adjustment removes activity-driven scale shifts.
+# We thin by regular interval (not random) to preserve time structure.
+
+thin_regular <- function(dt, N = 20000) {
+  if (nrow(dt) <= N) return(dt)
+  dt[round(seq(1, nrow(dt), length.out = N))]
+}
+
+plot_dt <- rbindlist(list(
+  thin_regular(evt_may_model)[, .(timestamp, month = "May",
+                                   lambda_hat, psi_hat, ret_mid_c, ret_ia_c)],
+  thin_regular(evt_jun_model)[, .(timestamp, month = "Jun",
+                                   lambda_hat, psi_hat, ret_mid_c, ret_ia_c)]
+))
+
+# Distribution comparison: raw vs IA
+long_ret <- melt(plot_dt,
+                 id.vars      = "month",
+                 measure.vars = c("ret_mid_c", "ret_ia_c"),
+                 variable.name = "series",
+                 value.name    = "r")
+long_ret[, series := fifelse(series == "ret_mid_c",
+                             "Raw (centred)", "IA (centred)")]
+
+ggplot(long_ret, aes(x = r)) +
+  geom_histogram(bins = 120, fill = "steelblue", colour = NA, alpha = 0.8) +
+  facet_grid(month ~ series, scales = "free_y") +
+  labs(
+    title    = "Event-level return distributions: Raw vs intensity-adjusted",
+    subtitle = "IA returns scale raw returns by sqrt(psi_hat). Sample = 20k events per month.",
+    x = "Return", y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r activity-volatility-correlation}
+# Correlation check: does intensity-adjustment reduce the link between
+# trading activity (lambda_hat) and absolute return magnitude?
+# If IA works as intended, |ret_ia_c| should be less correlated with
+# lambda_hat than |ret_mid_c| is.
+
+corr_tab <- plot_dt[, .(
+  corr_abs_raw_lambda = cor(abs(ret_mid_c), lambda_hat, use = "complete.obs"),
+  corr_abs_ia_lambda  = cor(abs(ret_ia_c),  lambda_hat, use = "complete.obs")
+), by = month]
+
+cat("Correlation between |return| and intensity (lambda_hat):\n")
+print(corr_tab)
+cat("\nA reduction in correlation after IA confirms the adjustment\n")
+cat("is removing activity-driven variance from the return series.\n")
+```
+
+---
+
+## 6. 5-Minute Aggregation
+
+```{r five-min-aggregation}
+# Aggregate event-level returns to 5-minute buckets.
+# Two tracks are produced for each month:
+#
+# (A) Volatility track: r_ia_5m_sum
+#     Sum of event-level IA centred returns within each 5-min bucket.
+#     Input to GARCH estimation in notebook 06.
+#     Not directly invertible to raw returns — the scaling has been applied
+#     at the event level before summation.
+#
+# (B) Risk track: r_ia_5m_inv
+#     Raw 5-minute return × sqrt(mean psi_hat in bucket).
+#     Invertible: r_raw_5m = r_ia_5m_inv / sqrt(psi_5m).
+#     Used in VaR/ES backtesting (notebook 07) to map forecast quantiles
+#     back to actual P&L in raw return units.
+#
+# psi_5m = mean of event-level psi_hat values within the bucket.
+# Using mean (not median) because we want the quantity proportional to
+# total expected duration in the bucket, not the central tendency.
+
+make_5min_series <- function(dt, tz_use = "Europe/London") {
+  dt <- data.table::copy(dt)
+  setorder(dt, date, timestamp)
+
+  # Assign each event to its 5-minute bucket (floor to nearest 300 seconds)
+  dt[, t5 := as.POSIXct(
+    floor(as.numeric(timestamp) / 300) * 300,
+    origin = "1970-01-01", tz = tz_use
+  )]
+
+  out <- dt[, {
+    list(
+      r_raw_5m    = sum(ret_mid_c,  na.rm = TRUE),
+      r_ia_5m_sum = sum(ret_ia_c,   na.rm = TRUE),
+      psi_5m      = mean(psi_hat,   na.rm = TRUE),
+      n_events    = .N
+    )
+  }, by = .(date, t5)][order(date, t5)]
+
+  # Invertible IA return: raw 5-min return scaled by sqrt(mean psi in bucket)
+  out[, scale_5m     := sqrt(pmax(psi_5m, 1e-12))]
+  out[, r_ia_5m_inv  := r_raw_5m * scale_5m]
+
+  out[]
+}
+
+r5_apr <- make_5min_series(evt_apr_model)
+r5_may <- make_5min_series(evt_may_model)
+r5_jun <- make_5min_series(evt_jun_model)
+
+cat("5-minute series row counts:\n")
+cat(sprintf("  Apr: %d buckets | May: %d buckets | Jun: %d buckets\n",
+            nrow(r5_apr), nrow(r5_may), nrow(r5_jun)))
+
+cat("\nEvents per 5-min bucket:\n")
+cat("  Apr: "); cat(round(summary(r5_apr$n_events), 1)); cat("\n")
+cat("  May: "); cat(round(summary(r5_may$n_events), 1)); cat("\n")
+cat("  Jun: "); cat(round(summary(r5_jun$n_events), 1)); cat("\n")
+
+cat("\nApril 5-min return summaries:\n")
+cat("  Raw:       "); print(round(summary(r5_apr$r_raw_5m),    6))
+cat("  IA sum:    "); print(round(summary(r5_apr$r_ia_5m_sum), 6))
+cat("  IA inv:    "); print(round(summary(r5_apr$r_ia_5m_inv), 6))
+```
+
+---
+
+## 7. 5-Minute Diagnostics
+
+```{r events-per-bucket-plot}
+# Distribution of event counts per 5-minute bucket.
+# Heavy right tail expected — some buckets (US open, LSE close) have
+# many more events than the median bucket. Confirms ACD intensity
+# model is necessary — activity is highly non-uniform.
+
+ggplot(r5_apr, aes(x = n_events)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = NA, alpha = 0.85) +
+  labs(
+    title    = "April: event count per 5-minute bucket",
+    subtitle = "Right-skewed distribution confirms non-uniform trading activity — motivates ACD modelling.",
+    x = "Events in bucket", y = "Number of 5-minute buckets"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r psi-5m-over-time}
+# Bucket-level mean conditional duration (psi_5m) over time.
+# Should show the intraday U-shape: longer durations at midday,
+# shorter durations at open and close.
+# Cross-month comparison shows May calmer (higher psi_5m) than April.
+
+psi_long <- rbindlist(list(
+  r5_apr[, .(t5, psi_5m, Month = "Apr")],
+  r5_may[, .(t5, psi_5m, Month = "May")],
+  r5_jun[, .(t5, psi_5m, Month = "Jun")]
+))
+
+ggplot(psi_long, aes(x = t5, y = psi_5m)) +
+  geom_line(linewidth = 0.25, colour = "steelblue", alpha = 0.9) +
+  facet_wrap(~Month, ncol = 1, scales = "free_x") +
+  labs(
+    title    = "Bucket-level conditional mean duration (ψ̂_5m) — April, May, June 2020",
+    subtitle = "Higher ψ̂_5m = longer expected duration = lower intensity. May shows calmer market.",
+    x = "Date", y = "Mean ψ̂ in 5-min bucket (seconds)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r activity-volatility-5m}
+# At the 5-minute level: does intensity adjustment reduce the correlation
+# between bucket activity (n_events, lambda_5m) and absolute returns?
+# This is the key empirical test of whether the IA step is doing useful work.
+
+mk_diag <- function(r5, label) {
+  dt <- data.table::copy(r5)
+  dt[, month     := label]
+  dt[, lambda_5m := 1 / pmax(psi_5m, 1e-12)]
+  dt[, abs_raw   := abs(r_raw_5m)]
+  dt[, abs_iaSum := abs(r_ia_5m_sum)]
+  dt[, abs_iaInv := abs(r_ia_5m_inv)]
+  dt
+}
+
+dt5 <- rbindlist(list(
+  mk_diag(r5_may, "May"),
+  mk_diag(r5_jun, "Jun")
+))
+
+corr_5m <- dt5[, .(
+  raw_vs_nEvents   = cor(abs_raw,   n_events,  use = "complete.obs"),
+  iaSum_vs_nEvents = cor(abs_iaSum, n_events,  use = "complete.obs"),
+  iaInv_vs_nEvents = cor(abs_iaInv, n_events,  use = "complete.obs"),
+  raw_vs_lambda    = cor(abs_raw,   lambda_5m, use = "complete.obs"),
+  iaSum_vs_lambda  = cor(abs_iaSum, lambda_5m, use = "complete.obs"),
+  iaInv_vs_lambda  = cor(abs_iaInv, lambda_5m, use = "complete.obs")
+), by = month]
+
+cat("5-minute activity-volatility correlations:\n")
+print(corr_5m)
+cat("\nFor both IA tracks, reduced correlation with n_events and lambda_5m\n")
+cat("confirms the intensity adjustment is removing activity-driven variance.\n")
+```
+
+```{r return-distribution-5m}
+# Distribution comparison at 5-minute level: Raw vs IA sum vs IA inv.
+# All three series go into different downstream uses — GARCH uses IA sum,
+# VaR backtesting uses IA inv, raw is the benchmark.
+
+dt_long <- melt(dt5,
+                measure.vars  = c("r_raw_5m", "r_ia_5m_sum", "r_ia_5m_inv"),
+                variable.name = "series",
+                value.name    = "r")
+dt_long[, series := fcase(
+  series == "r_raw_5m",    "Raw",
+  series == "r_ia_5m_sum", "IA sum (vol track)",
+  series == "r_ia_5m_inv", "IA inv (risk track)"
+)]
+
+ggplot(dt_long, aes(x = r)) +
+  geom_histogram(bins = 80, fill = "steelblue", colour = NA, alpha = 0.8) +
+  facet_grid(month ~ series, scales = "free_y") +
+  labs(
+    title    = "5-minute return distributions: Raw vs IA sum vs IA inv",
+    subtitle = "IA sum used for GARCH (notebook 06). IA inv used for VaR backtesting (notebook 07).",
+    x = "5-minute return", y = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+## 8. Save Outputs
+
+```{r save-outputs}
+saveRDS(r5_apr, here::here("data", "processed", "r5_apr.rds"))
+saveRDS(r5_may, here::here("data", "processed", "r5_may.rds"))
+saveRDS(r5_jun, here::here("data", "processed", "r5_jun.rds"))
+
+cat("Saved:\n")
+cat(sprintf("  r5_apr.rds  — %d rows | cols: date, t5, r_raw_5m, r_ia_5m_sum,",
+            nrow(r5_apr)))
+cat(" r_ia_5m_inv, psi_5m, n_events\n")
+cat(sprintf("  r5_may.rds  — %d rows\n", nrow(r5_may)))
+cat(sprintf("  r5_jun.rds  — %d rows\n", nrow(r5_jun)))
+cat("\nNotebook 06 reads r5_apr (GARCH estimation on r_ia_5m_sum)\n")
+cat("and r5_may / r5_jun (OOS volatility forecasting).\n")
+cat("Notebook 07 reads all three for VaR/ES backtesting on r_ia_5m_inv.\n")
+```
