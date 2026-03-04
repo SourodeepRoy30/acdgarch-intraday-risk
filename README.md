@@ -21,7 +21,7 @@ We then fit GARCH models on both the raw and intensity-adjusted series, compare 
 
 ## Key Results
 
-All models trained on **April 2024 only** and evaluated out-of-sample on **May and June 2024**.
+All models trained on **April 2020 only** and evaluated out-of-sample on **May and June 2020**.
 
 ### Volatility Forecasting
 
@@ -55,7 +55,7 @@ The IA-mapped model produces lower FZ0 joint VaR-ES loss in all 12 evaluation co
 ### Data
 - **Asset:** BP plc ordinary shares (BP.L), London Stock Exchange
 - **Source:** Refinitiv Tick History
-- **Period:** April–June 2024
+- **Period:** April–June 2020
 - **Volume:** 1,270,000+ individual tick quotes
 - **Cleaning:** Zero-return filtering, overnight gap removal, exchange hours restriction (08:00–16:30 BST)
 
